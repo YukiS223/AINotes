@@ -11,7 +11,6 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            // SIDEBAR: notebook list
             List(selection: $selectedNotebook) {
                 ForEach(notebooks) { notebook in
                     NavigationLink(value: notebook) {
@@ -34,7 +33,6 @@ struct ContentView: View {
                 }
             }
         } detail: {
-            // DETAIL: pages of the selected notebook
             if let notebook = selectedNotebook {
                 NotebookView(notebook: notebook)
             } else {
@@ -49,7 +47,6 @@ struct ContentView: View {
 
     private func addNotebook() {
         let nb = Notebook(title: "Untitled \(notebooks.count + 1)")
-        // Start every new notebook with one blank page
         let firstPage = Page(index: 0)
         firstPage.notebook = nb
         nb.pages.append(firstPage)
@@ -117,20 +114,60 @@ struct PageEditor: View {
     @Bindable var page: Page
     @State private var drawing = PKDrawing()
     @State private var showTutor = false
-    
+
+    @State private var aiAnnotations: [AnnotationDTO] = []
+    @State private var aiBounds: CGRect = .zero
+    @State private var showGrid = false
+
+    private var snapshotBounds: CGRect {
+        let b = drawing.bounds
+        return b.isEmpty
+            ? CGRect(x: 0, y: 0, width: 1024, height: 1366)
+            : b.insetBy(dx: -40, dy: -40)
+    }
+
     var body: some View {
-        CanvasView(drawing: $drawing)
-            .ignoresSafeArea(edges: .bottom)
-            .onAppear {
-                if !page.drawingData.isEmpty,
-                   let loaded = try? PKDrawing(data: page.drawingData) {
-                    drawing = loaded
+        ZStack {
+            CanvasView(drawing: $drawing)
+            if showGrid {
+                CoordinateGrid(bounds: snapshotBounds)
+            }
+            AnnotationOverlay(
+                annotations: aiAnnotations,
+                snapshotBounds: aiBounds,
+                inkBounds: drawing.strokes.map(\.renderBounds)
+            )
+        }
+        .ignoresSafeArea(edges: .bottom)
+        .onAppear {
+            if !page.drawingData.isEmpty,
+               let loaded = try? PKDrawing(data: page.drawingData) {
+                drawing = loaded
+            }
+        }
+        .onChange(of: drawing) { _, newValue in
+            page.drawingData = newValue.dataRepresentation()
+        }
+        .overlay(alignment: .topTrailing) {
+            HStack(spacing: 8) {
+                Button {
+                    showGrid.toggle()
+                } label: {
+                    Label("Grid", systemImage: showGrid ? "grid.circle.fill" : "grid.circle")
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial, in: Capsule())
                 }
-            }
-            .onChange(of: drawing) { _, newValue in
-                page.drawingData = newValue.dataRepresentation()
-            }
-            .overlay(alignment: .topTrailing) {
+                if !aiAnnotations.isEmpty {
+                    Button {
+                        aiAnnotations = []
+                    } label: {
+                        Label("Clear AI", systemImage: "eraser")
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.regularMaterial, in: Capsule())
+                    }
+                }
                 Button {
                     showTutor = true
                 } label: {
@@ -140,27 +177,94 @@ struct PageEditor: View {
                         .background(.tint, in: Capsule())
                         .foregroundStyle(.white)
                 }
-                .padding()
             }
-            .sheet(isPresented: $showTutor) {
-                TutorPanel(captureSnapshot: snapshot)
-            }
-    }
-    
-    private func snapshot() -> UIImage? {
-        let drawingBounds = drawing.bounds
-        let bounds = drawingBounds.isEmpty
-        ? CGRect(x: 0, y: 0, width: 1024, height: 1366)
-        : drawingBounds.insetBy(dx: -40, dy: -40)
-        
-        // PKDrawing renders strokes on a transparent background.
-        // JPEG can't represent transparency, so we composite onto white first.
-        let strokeImage = drawing.image(from: bounds, scale: 2.0)
-        let renderer = UIGraphicsImageRenderer(size: strokeImage.size)
-        return renderer.image { context in
-            UIColor.white.setFill()
-            context.fill(CGRect(origin: .zero, size: strokeImage.size))
-            strokeImage.draw(in: CGRect(origin: .zero, size: strokeImage.size))
+            .padding()
         }
+        .sheet(isPresented: $showTutor) {
+            TutorPanel(
+                captureSnapshot: snapshot,
+                onAnnotations: { anns, bounds in
+                    aiBounds = bounds
+                    aiAnnotations = anns
+                }
+            )
+        }
+    }
+
+    private func snapshot() -> CanvasSnapshot? {
+        let bounds = snapshotBounds
+        let strokeImage = drawing.image(from: bounds, scale: 2.0)
+        let size = strokeImage.size
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let composited = renderer.image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            strokeImage.draw(in: CGRect(origin: .zero, size: size))
+            drawGrid(in: ctx.cgContext, size: size)
+        }
+        return CanvasSnapshot(image: composited, bounds: bounds)
+    }
+
+    private func drawGrid(in cg: CGContext, size: CGSize) {
+        let steps = 10
+        let font = UIFont.systemFont(ofSize: 11, weight: .semibold)
+        let labelAttrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: UIColor.systemBlue.withAlphaComponent(0.9)
+        ]
+        cg.setLineWidth(1)
+        for i in 0...steps {
+            let f = CGFloat(i) / CGFloat(steps)
+            let x = f * size.width
+            let y = f * size.height
+            let strong = (i % 5 == 0)
+            cg.setStrokeColor(UIColor.systemBlue
+                .withAlphaComponent(strong ? 0.45 : 0.20).cgColor)
+            cg.move(to: CGPoint(x: x, y: 0))
+            cg.addLine(to: CGPoint(x: x, y: size.height))
+            cg.move(to: CGPoint(x: 0, y: y))
+            cg.addLine(to: CGPoint(x: size.width, y: y))
+            cg.strokePath()
+            let label = String(format: "%.1f", Double(f))
+            (label as NSString).draw(at: CGPoint(x: x + 2, y: 2),
+                                     withAttributes: labelAttrs)
+            (label as NSString).draw(at: CGPoint(x: 2, y: y + 2),
+                                     withAttributes: labelAttrs)
+        }
+    }
+}
+
+private struct CoordinateGrid: View {
+    let bounds: CGRect
+    var body: some View {
+        Canvas { ctx, _ in
+            guard bounds.width > 0, bounds.height > 0 else { return }
+            let steps = 10
+            for i in 0...steps {
+                let f = CGFloat(i) / CGFloat(steps)
+                let strong = (i % 5 == 0)
+                let col = Color.blue.opacity(strong ? 0.45 : 0.20)
+                let x = bounds.minX + f * bounds.width
+                let y = bounds.minY + f * bounds.height
+                var v = Path()
+                v.move(to: CGPoint(x: x, y: bounds.minY))
+                v.addLine(to: CGPoint(x: x, y: bounds.maxY))
+                ctx.stroke(v, with: .color(col), lineWidth: 1)
+                var h = Path()
+                h.move(to: CGPoint(x: bounds.minX, y: y))
+                h.addLine(to: CGPoint(x: bounds.maxX, y: y))
+                ctx.stroke(h, with: .color(col), lineWidth: 1)
+                let label = String(format: "%.1f", Double(f))
+                ctx.draw(Text(label).font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.blue),
+                         at: CGPoint(x: x + 8, y: bounds.minY + 8),
+                         anchor: .topLeading)
+                ctx.draw(Text(label).font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.blue),
+                         at: CGPoint(x: bounds.minX + 8, y: y + 8),
+                         anchor: .topLeading)
+            }
+        }
+        .allowsHitTesting(false)
     }
 }

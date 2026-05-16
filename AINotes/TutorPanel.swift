@@ -2,8 +2,6 @@
 //  TutorPanel.swift
 //  AINotes
 //
-//  Created by 落 on 2026-05-15.
-//
 import SwiftUI
 import PencilKit
 
@@ -16,30 +14,31 @@ final class TutorViewModel {
 
     private let client = LLMClient()
 
-    func askAboutCanvas(image: UIImage, userQuestion: String) async {
+    func askAboutCanvas(image: UIImage,
+                        userQuestion: String) async -> [AnnotationDTO]? {
         isLoading = true
         errorText = nil
         defer { isLoading = false }
 
-        // Show the user's turn immediately for snappy UX.
         let userText = userQuestion.isEmpty ? "(Screenshot sent)" : userQuestion
         messages.append(.init(role: .user, text: userText))
 
-        // Pass conversation history *excluding* the just-appended user turn,
-        // since the API call adds the current turn itself.
         let history = Array(messages.dropLast())
 
         do {
-            let reply = try await client.askAboutCanvas(
+            let result = try await client.askAboutCanvas(
                 image: image,
                 userQuestion: userQuestion,
                 history: history
             )
-            messages.append(.init(role: .assistant, text: reply))
+            messages.append(.init(role: .assistant, text: result.reply))
+            return result.annotations
         } catch {
             errorText = error.localizedDescription
+            return nil
         }
-    }}
+    }
+}
 
 struct TutorMessage: Identifiable {
     enum Role { case user, assistant }
@@ -49,7 +48,9 @@ struct TutorMessage: Identifiable {
 }
 
 struct TutorPanel: View {
-    let captureSnapshot: () -> UIImage?
+    let captureSnapshot: () -> CanvasSnapshot?
+    let onAnnotations: ([AnnotationDTO], CGRect) -> Void
+
     @State private var vm = TutorViewModel()
     @State private var userInput: String = ""
     @Environment(\.dismiss) private var dismiss
@@ -57,7 +58,6 @@ struct TutorPanel: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Messages
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
@@ -88,23 +88,28 @@ struct TutorPanel: View {
 
                 Divider()
 
-                // Input row
-                HStack(spacing: 8) {
-                    TextField("Ask a question (optional)", text: $userInput, axis: .vertical)
-                        .textFieldStyle(.roundedBorder)
-                        .lineLimit(1...4)
+                VStack(spacing: 4) {
+                    HStack(spacing: 8) {
+                        TextField("Ask a question (optional)",
+                                  text: $userInput, axis: .vertical)
+                            .textFieldStyle(.roundedBorder)
+                            .lineLimit(1...4)
+                            .submitLabel(.send)
+                            .onSubmit { sendSnapshot() }
 
-                    Button {
-                        sendSnapshot()
-                    } label: {
-                        Label("Screenshot", systemImage: "camera.viewfinder")
-                            .labelStyle(.iconOnly)
-                            .font(.title2)
-                            .padding(8)
-                            .background(.tint, in: Circle())
-                            .foregroundStyle(.white)
+                        Button {
+                            sendSnapshot()
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(vm.isLoading ? Color.gray : Color.accentColor)
+                        }
+                        .disabled(vm.isLoading)
                     }
-                    .disabled(vm.isLoading)
+                    Text("Send captures a fresh screenshot with your question.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding()
             }
@@ -119,13 +124,19 @@ struct TutorPanel: View {
     }
 
     private func sendSnapshot() {
-        guard let image = captureSnapshot() else {
+        guard !vm.isLoading else { return }
+        guard let snap = captureSnapshot() else {
             vm.errorText = "Couldn't capture the canvas."
             return
         }
         let question = userInput
         userInput = ""
-        Task { await vm.askAboutCanvas(image: image, userQuestion: question) }
+        Task {
+            if let anns = await vm.askAboutCanvas(image: snap.image,
+                                                  userQuestion: question) {
+                onAnnotations(anns, snap.bounds)
+            }
+        }
     }
 }
 
@@ -136,7 +147,8 @@ private struct MessageBubble: View {
             if message.role == .assistant {
                 Text(message.text)
                     .padding(10)
-                    .background(.gray.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+                    .background(.gray.opacity(0.15),
+                                in: RoundedRectangle(cornerRadius: 12))
                 Spacer(minLength: 40)
             } else {
                 Spacer(minLength: 40)
@@ -149,4 +161,3 @@ private struct MessageBubble: View {
         .padding(.horizontal)
     }
 }
-

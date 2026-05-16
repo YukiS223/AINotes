@@ -2,8 +2,6 @@
 //  LLMClient.swift
 //  AINotes
 //
-//  Created by 落 on 2026-05-15.
-//
 import Foundation
 import UIKit
 
@@ -21,51 +19,76 @@ enum LLMError: Error, LocalizedError {
     }
 }
 
+struct TutorResponse {
+    let reply: String
+    let annotations: [AnnotationDTO]
+}
+
 struct LLMClient {
-    // Update this when Anthropic ships newer Sonnet/Opus revs.
-    // Sonnet 4.5 is the current solid choice for vision + reasoning as of mid-2026.
     let model = "claude-sonnet-4-5"
 
-    func askAboutCanvas(image: UIImage, userQuestion: String, history: [TutorMessage]) async throws -> String {
-        // 1. Encode image as base64 JPEG (smaller payload than PNG, plenty for handwriting).
+    func askAboutCanvas(image: UIImage,
+                        userQuestion: String,
+                        history: [TutorMessage]) async throws -> TutorResponse {
         guard let jpegData = image.jpegData(compressionQuality: 0.8) else {
             throw LLMError.badImage
         }
         let base64Image = jpegData.base64EncodedString()
 
-        // 2. Build the messages array.
-        //    System prompt steers Claude to act like a tutor.
         let systemPrompt = """
-            You are a friendly, patient AI tutor helping a student who is taking handwritten notes \
-            on an iPad. You will be shown a screenshot of their current note page. Read what they've \
-            written or drawn, and:
-            - If they asked a question, answer it clearly with relevant context from the page.
-            - If they didn't ask anything specific, briefly identify what they're working on and offer \
-              one concrete next step or a small check-for-understanding question.
-            Be concise. Use plain text (no markdown formatting). Keep responses under ~150 words \
-            unless the student asks for more detail.
+            You are a friendly, patient AI tutor helping a student taking \
+            handwritten notes on an iPad. You are shown a screenshot of their \
+            current page.
+
+            COORDINATE GRID: a faint blue grid is drawn over the image. \
+            Gridlines appear every 0.1. Numbers along the TOP edge label the x \
+            value of each vertical line (0.0 far left, 1.0 far right). Numbers \
+            along the LEFT edge label the y value of each horizontal line (0.0 \
+            top, 1.0 bottom). Read coordinates off this grid by interpolating \
+            between the nearest labelled lines. The grid is only a guide and is \
+            NOT on the student's real page.
+
+            IMPORTANT: for circle and highlight, your box does NOT need to be \
+            tight or perfectly centered. The app automatically snaps it to the \
+            exact pixels of the student's handwriting. Just make a box that \
+            clearly OVERLAPS the target item and is not so large it also covers \
+            neighboring items. Prioritize selecting the RIGHT item over precise \
+            sizing.
+
+            Actions (coordinates are grid fractions):
+            - circle:    {"type":"circle","x","y","width","height","color"} \
+              x,y = top-left of a box that overlaps the target.
+            - highlight: {"type":"highlight","x","y","width","height","color"} \
+              x,y = top-left of a box that overlaps the target.
+            - arrow:     {"type":"arrow","x1","y1","x2","y2","color"} \
+              arrowhead at x2,y2 points AT the target; start the tail in \
+              nearby empty space.
+            - write:     {"type":"write","x","y","text","color"} \
+              x,y = top-left in EMPTY space near the relevant work, not over \
+              it. Keep text very short.
+            Colors: red, blue, green, orange, yellow, purple, black.
+
+            RESPOND WITH ONE JSON OBJECT AND NOTHING ELSE. No markdown, no \
+            backticks, no text outside the JSON. Shape:
+            {"reply": "<plain-text tutor reply, under ~120 words>", \
+             "annotations": [ ...zero or more actions... ]}
+            If no marks would help, use an empty annotations array. Do not \
+            mention the grid in your reply.
             """
 
-        // Build prior turns as plain-text history (no images on past turns to save tokens).
         var apiMessages: [[String: Any]] = history.map { msg in
-            [
-                "role": msg.role == .user ? "user" : "assistant",
-                "content": msg.text
-            ]
+            ["role": msg.role == .user ? "user" : "assistant",
+             "content": msg.text]
         }
 
-        // Current turn: image + (optional) text question.
         var currentContent: [[String: Any]] = [
-            [
-                "type": "image",
-                "source": [
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": base64Image
-                ]
-            ]
+            ["type": "image",
+             "source": ["type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64Image]]
         ]
-        let questionText = userQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let questionText = userQuestion
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         if !questionText.isEmpty {
             currentContent.append(["type": "text", "text": questionText])
         } else {
@@ -76,7 +99,6 @@ struct LLMClient {
         }
         apiMessages.append(["role": "user", "content": currentContent])
 
-        // 3. Build the request.
         let body: [String: Any] = [
             "model": model,
             "max_tokens": 1024,
@@ -91,7 +113,6 @@ struct LLMClient {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        // 4. Send and parse.
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw LLMError.decoding("No HTTP response")
@@ -101,20 +122,43 @@ struct LLMClient {
             throw LLMError.http(http.statusCode, bodyText)
         }
 
-        // Anthropic response shape:
-        // { "content": [ { "type": "text", "text": "..." }, ... ], ... }
         guard
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let contentArr = json["content"] as? [[String: Any]]
         else {
             throw LLMError.decoding("Unexpected top-level shape")
         }
-        let text = contentArr
+        let rawText = contentArr
             .compactMap { $0["text"] as? String }
             .joined(separator: "\n")
-        if text.isEmpty {
+        if rawText.isEmpty {
             throw LLMError.decoding("No text in response")
         }
-        return text
+
+        return parse(rawText)
+    }
+
+    private func parse(_ raw: String) -> TutorResponse {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("```") {
+            s = s.replacingOccurrences(of: "```json", with: "")
+                 .replacingOccurrences(of: "```", with: "")
+                 .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let first = s.firstIndex(of: "{"),
+           let last = s.lastIndex(of: "}") {
+            s = String(s[first...last])
+        }
+
+        struct Raw: Decodable {
+            let reply: String
+            let annotations: [AnnotationDTO]?
+        }
+        if let d = s.data(using: .utf8),
+           let parsed = try? JSONDecoder().decode(Raw.self, from: d) {
+            return TutorResponse(reply: parsed.reply,
+                                 annotations: parsed.annotations ?? [])
+        }
+        return TutorResponse(reply: raw, annotations: [])
     }
 }
