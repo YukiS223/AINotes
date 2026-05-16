@@ -1,10 +1,3 @@
-//
-//  AINotesApp.swift
-//  AINotes
-//
-//  Created by 落 on 2026-05-15.
-//
-
 import SwiftUI
 import SwiftData
 
@@ -12,7 +5,8 @@ import SwiftData
 struct AINotesApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            Notebook.self,
+            Page.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
