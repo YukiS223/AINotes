@@ -8,12 +8,36 @@ struct AINotesApp: App {
             Notebook.self,
             Page.self,
         ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
+        let modelConfiguration = ModelConfiguration(
+            schema: schema,
+            isStoredInMemoryOnly: false
+        )
 
         do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
+            return try ModelContainer(
+                for: schema,
+                configurations: [modelConfiguration]
+            )
         } catch {
-            fatalError("Could not create ModelContainer: \(error)")
+            // A schema change can make the OLD on-disk store unmigratable
+            // during development. Rather than hard-crashing, log it and
+            // start from a fresh store. (In a shipped app with real user
+            // data you'd write a SchemaMigrationPlan instead — noted as a
+            // deferred item, not done here.)
+            print("⚠️ ModelContainer failed to open existing store: \(error)")
+            print("⚠️ Falling back to a fresh in-memory-safe store.")
+            let fallback = ModelConfiguration(
+                schema: schema,
+                isStoredInMemoryOnly: true
+            )
+            do {
+                return try ModelContainer(
+                    for: schema,
+                    configurations: [fallback]
+                )
+            } catch {
+                fatalError("Could not create fallback ModelContainer: \(error)")
+            }
         }
     }()
 

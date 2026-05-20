@@ -49,25 +49,25 @@ struct LLMClient {
             NOT on the student's real page.
 
             IMPORTANT: for circle and highlight, your box does NOT need to be \
-            tight or perfectly centered. The app automatically snaps it to the \
-            exact pixels of the student's handwriting. Just make a box that \
-            clearly OVERLAPS the target item and is not so large it also covers \
-            neighboring items. Prioritize selecting the RIGHT item over precise \
-            sizing.
+                        tight or perfectly centered. The app automatically snaps it to the \
+                        exact pixels of the student's handwriting. Just make a box that \
+                        clearly OVERLAPS the target item and is not so large it also covers \
+                        neighboring items. Prioritize selecting the RIGHT item over precise \
+                        sizing.
 
-            Actions (coordinates are grid fractions):
-            - circle:    {"type":"circle","x","y","width","height","color"} \
-              x,y = top-left of a box that overlaps the target.
-            - highlight: {"type":"highlight","x","y","width","height","color"} \
-              x,y = top-left of a box that overlaps the target.
-            - arrow:     {"type":"arrow","x1","y1","x2","y2","color"} \
-              arrowhead at x2,y2 points AT the target; start the tail in \
-              nearby empty space.
-            - write:     {"type":"write","x","y","text","color"} \
-              x,y = top-left in EMPTY space near the relevant work, not over \
-              it. Keep text very short.
-            Colors: red, blue, green, orange, yellow, purple, black.
-
+                        Actions (coordinates are grid fractions):
+                        - circle:    {"type":"circle","x","y","width","height","color"} \
+                          x,y = top-left of a box that overlaps the target.
+                        - highlight: {"type":"highlight","x","y","width","height","color"} \
+                          x,y = top-left of a box that overlaps the target.
+                        - arrow:     {"type":"arrow","x1","y1","x2","y2","color"} \
+                          arrowhead at x2,y2 points AT the target; start the tail in \
+                          nearby empty space.
+                        - write:     {"type":"write","x","y","text","color"} \
+                          x,y = top-left in EMPTY space near the relevant work, not over \
+                          it. Keep text very short.
+                        Colors: red, blue, green, orange, yellow, purple, black.
+            
             RESPOND WITH ONE JSON OBJECT AND NOTHING ELSE. No markdown, no \
             backticks, no text outside the JSON. Shape:
             {"reply": "<plain-text tutor reply, under ~120 words>", \

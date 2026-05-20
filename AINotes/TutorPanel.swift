@@ -40,19 +40,30 @@ final class TutorViewModel {
     }
 }
 
-struct TutorMessage: Identifiable {
-    enum Role { case user, assistant }
+struct TutorMessage: Identifiable, Codable {
+    enum Role: String, Codable { case user, assistant }
     let id = UUID()
     let role: Role
     let text: String
+
+    // `id` is in-memory identity for SwiftUI's ForEach, not saved data.
+    // Excluding it from CodingKeys silences the warning and stops a
+    // saved id from being (pointlessly) re-generated on decode.
+    private enum CodingKeys: String, CodingKey {
+        case role, text
+    }
 }
 
 struct TutorPanel: View {
     let captureSnapshot: () -> CanvasSnapshot?
     let onAnnotations: ([AnnotationDTO], CGRect) -> Void
+    // Persisted thread for this page, and a way to report changes back.
+    let initialMessages: [TutorMessage]
+    let onMessagesChanged: ([TutorMessage]) -> Void
 
     @State private var vm = TutorViewModel()
     @State private var userInput: String = ""
+    @State private var didSeed = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -119,6 +130,17 @@ struct TutorPanel: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
                 }
+            }
+            // Load the saved thread the first time the sheet opens.
+            .onAppear {
+                if !didSeed {
+                    vm.messages = initialMessages
+                    didSeed = true
+                }
+            }
+            // Persist whenever a turn is added (messages only ever append).
+            .onChange(of: vm.messages.count) { _, _ in
+                if didSeed { onMessagesChanged(vm.messages) }
             }
         }
     }

@@ -22,12 +22,20 @@ final class Notebook {
 final class Page {
     var index: Int            // page order within the notebook
     var drawingData: Data     // serialized PKDrawing
+    var chatData: Data        // JSON-encoded [TutorMessage] (the tutor thread)
+    var annotationData: Data  // JSON-encoded StoredAnnotations (the AI marks)
     var createdAt: Date
     var notebook: Notebook?
 
-    init(index: Int, drawingData: Data = Data(), createdAt: Date = .now) {
+    init(index: Int,
+         drawingData: Data = Data(),
+         chatData: Data = Data(),
+         annotationData: Data = Data(),
+         createdAt: Date = .now) {
         self.index = index
         self.drawingData = drawingData
+        self.chatData = chatData
+        self.annotationData = annotationData
         self.createdAt = createdAt
     }
 }

@@ -139,12 +139,7 @@ struct PageEditor: View {
             )
         }
         .ignoresSafeArea(edges: .bottom)
-        .onAppear {
-            if !page.drawingData.isEmpty,
-               let loaded = try? PKDrawing(data: page.drawingData) {
-                drawing = loaded
-            }
-        }
+        .onAppear { loadPersisted() }
         .onChange(of: drawing) { _, newValue in
             page.drawingData = newValue.dataRepresentation()
         }
@@ -161,6 +156,8 @@ struct PageEditor: View {
                 if !aiAnnotations.isEmpty {
                     Button {
                         aiAnnotations = []
+                        aiBounds = .zero
+                        page.annotationData = Data()   // clear persistence too
                     } label: {
                         Label("Clear AI", systemImage: "eraser")
                             .padding(.horizontal, 12)
@@ -186,10 +183,44 @@ struct PageEditor: View {
                 onAnnotations: { anns, bounds in
                     aiBounds = bounds
                     aiAnnotations = anns
-                }
+                    saveAnnotations()
+                },
+                initialMessages: loadMessages(),
+                onMessagesChanged: { saveMessages($0) }
             )
         }
     }
+
+    // MARK: - Persistence (JSON blobs on the Page, like drawingData)
+
+    private func loadPersisted() {
+        if !page.drawingData.isEmpty,
+           let loaded = try? PKDrawing(data: page.drawingData) {
+            drawing = loaded
+        }
+        if let stored = try? JSONDecoder()
+            .decode(StoredAnnotations.self, from: page.annotationData) {
+            aiAnnotations = stored.annotations
+            aiBounds = stored.bounds
+        }
+    }
+
+    private func saveAnnotations() {
+        let stored = StoredAnnotations(annotations: aiAnnotations,
+                                       bounds: aiBounds)
+        page.annotationData = (try? JSONEncoder().encode(stored)) ?? Data()
+    }
+
+    private func loadMessages() -> [TutorMessage] {
+        (try? JSONDecoder()
+            .decode([TutorMessage].self, from: page.chatData)) ?? []
+    }
+
+    private func saveMessages(_ msgs: [TutorMessage]) {
+        page.chatData = (try? JSONEncoder().encode(msgs)) ?? Data()
+    }
+
+    // MARK: - Snapshot (white bg + grid, unchanged)
 
     private func snapshot() -> CanvasSnapshot? {
         let bounds = snapshotBounds
