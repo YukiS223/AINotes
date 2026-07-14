@@ -20,23 +20,35 @@ struct AINotesApp: App {
             )
         } catch {
             // A schema change can make the OLD on-disk store unmigratable
-            // during development. Rather than hard-crashing, log it and
-            // start from a fresh store. (In a shipped app with real user
-            // data you'd write a SchemaMigrationPlan instead — noted as a
-            // deferred item, not done here.)
+            // during development. The old fallback silently switched to an
+            // IN-MEMORY store: the app looked fine but every note written
+            // that session evaporated on quit, forever, with no indication.
+            // Instead: move the incompatible store aside (recoverable) and
+            // start a fresh PERSISTENT one. (A shipped app would use a
+            // SchemaMigrationPlan; still a deferred item.)
             print("⚠️ ModelContainer failed to open existing store: \(error)")
-            print("⚠️ Falling back to a fresh in-memory-safe store.")
-            let fallback = ModelConfiguration(
-                schema: schema,
-                isStoredInMemoryOnly: true
-            )
+            let fm = FileManager.default
+            if let support = fm.urls(for: .applicationSupportDirectory,
+                                     in: .userDomainMask).first {
+                let stamp = Int(Date.now.timeIntervalSince1970)
+                for name in ["default.store", "default.store-shm", "default.store-wal"] {
+                    let url = support.appendingPathComponent(name)
+                    if fm.fileExists(atPath: url.path) {
+                        try? fm.moveItem(
+                            at: url,
+                            to: support.appendingPathComponent("\(name).incompatible-\(stamp)")
+                        )
+                    }
+                }
+            }
+            print("⚠️ Moved incompatible store aside; creating a fresh persistent store.")
             do {
                 return try ModelContainer(
                     for: schema,
-                    configurations: [fallback]
+                    configurations: [modelConfiguration]
                 )
             } catch {
-                fatalError("Could not create fallback ModelContainer: \(error)")
+                fatalError("Could not create fresh ModelContainer: \(error)")
             }
         }
     }()

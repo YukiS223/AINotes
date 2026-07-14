@@ -16,6 +16,18 @@ struct CanvasView: UIViewRepresentable {
         canvas.drawingPolicy = .anyInput
         canvas.delegate = context.coordinator
         canvas.backgroundColor = .systemBackground
+        // Pin the coordinate space: no scrolling, no automatic safe-area
+        // content inset, no zoom. The AI overlay canvas and the snapshot
+        // pipeline both assume this drawing's (0,0) is exactly the view's
+        // top-left; an automatic inset here shifts user ink ~47pt relative
+        // to the AI ink and to what the model sees, so the model points at
+        // the wrong spot. (The AI canvas already pins these — the two
+        // layers must match.)
+        canvas.isScrollEnabled = false
+        canvas.contentInsetAdjustmentBehavior = .never
+        canvas.contentInset = .zero
+        canvas.minimumZoomScale = 1.0
+        canvas.maximumZoomScale = 1.0
         context.coordinator.canvas = canvas
 
         // Do NOT grab focus or attach the picker here. In a paged TabView

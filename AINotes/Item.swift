@@ -1,4 +1,4 @@
-//Item.swift to Models.swift
+// Item.swift / Models.swift
 import Foundation
 import SwiftData
 import PencilKit
@@ -8,7 +8,6 @@ final class Notebook {
     var title: String
     var createdAt: Date
 
-    // Cascade delete: deleting a notebook deletes its pages
     @Relationship(deleteRule: .cascade, inverse: \Page.notebook)
     var pages: [Page] = []
 
@@ -21,9 +20,10 @@ final class Notebook {
 @Model
 final class Page {
     var index: Int            // page order within the notebook
-    var drawingData: Data     // serialized PKDrawing
-    var chatData: Data        // JSON-encoded [TutorMessage] (the tutor thread)
-    var annotationData: Data  // JSON-encoded StoredAnnotations (the AI marks)
+    var drawingData: Data     // serialized PKDrawing (user ink)
+    var chatData: Data        // JSON-encoded [TutorMessage]
+    var annotationData: Data  // JSON-encoded StoredAnnotations (marks over user ink)
+    var aiDrawingData: Data   // JSON-encoded StoredAIDrawing (generative AI strokes + labels)
     var createdAt: Date
     var notebook: Notebook?
 
@@ -31,11 +31,13 @@ final class Page {
          drawingData: Data = Data(),
          chatData: Data = Data(),
          annotationData: Data = Data(),
+         aiDrawingData: Data = Data(),
          createdAt: Date = .now) {
         self.index = index
         self.drawingData = drawingData
         self.chatData = chatData
         self.annotationData = annotationData
+        self.aiDrawingData = aiDrawingData
         self.createdAt = createdAt
     }
 }

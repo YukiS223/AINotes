@@ -35,6 +35,11 @@ struct ContentView: View {
         } detail: {
             if let notebook = selectedNotebook {
                 NotebookView(notebook: notebook)
+                    // Force fresh view state (page index etc.) per notebook.
+                    // Without this, switching notebooks reuses the old
+                    // NotebookView state and the TabView selection can point
+                    // at a page index the new notebook doesn't have.
+                    .id(notebook.persistentModelID)
             } else {
                 ContentUnavailableView(
                     "No Notebook Selected",
@@ -56,7 +61,12 @@ struct ContentView: View {
 
     private func deleteNotebooks(at offsets: IndexSet) {
         for index in offsets {
-            context.delete(notebooks[index])
+            let nb = notebooks[index]
+            // Clear the selection first — the detail view holds a
+            // @Bindable to this model and would otherwise keep rendering
+            // a deleted object.
+            if selectedNotebook === nb { selectedNotebook = nil }
+            context.delete(nb)
         }
     }
 }
@@ -115,34 +125,85 @@ struct PageEditor: View {
     @State private var drawing = PKDrawing()
     @State private var showTutor = false
 
+    // Mark-over-ink layer (existing).
     @State private var aiAnnotations: [AnnotationDTO] = []
     @State private var aiBounds: CGRect = .zero
-    @State private var showGrid = false
 
-    private var snapshotBounds: CGRect {
-        let b = drawing.bounds
-        return b.isEmpty
-            ? CGRect(x: 0, y: 0, width: 1024, height: 1366)
-            : b.insetBy(dx: -40, dy: -40)
+    // Generative draw layer (new).
+    @State private var aiPlayer = AIDrawingPlayer()
+
+    @State private var showGrid = false
+    @State private var canvasSize: CGSize = .zero
+    @State private var liveSession = LiveSession()
+
+    /// The coordinate space the model addresses with fractional coords.
+    /// = the visible viewport. Drawings at x=0.5 land in the middle of
+    /// what the user sees on screen, regardless of where their ink is.
+    private var canvasBounds: CGRect {
+        canvasSize == .zero
+            ? CGRect(x: 0, y: 0, width: 820, height: 1100)
+            : CGRect(origin: .zero, size: canvasSize)
+    }
+    private var isLiveSession: Bool {
+        if case .live = liveSession.state { return true }
+        return false
+    }
+    private var hasAIContent: Bool {
+        !aiAnnotations.isEmpty
+            || !aiPlayer.committedDrawing.strokes.isEmpty
+            || !aiPlayer.labels.isEmpty
+            || aiPlayer.inProgressStroke != nil
     }
 
     var body: some View {
         ZStack {
             CanvasView(drawing: $drawing)
-            if showGrid {
-                CoordinateGrid(bounds: snapshotBounds)
-            }
+            // AI ink layer — non-interactive, sits above user canvas.
+            AIDrawingCanvas(drawing: aiPlayer.displayedDrawing)
+                .allowsHitTesting(false)
+            // AI text labels.
+            AILabelsOverlay(labels: aiPlayer.labels)
+            // Marks-over-ink (snapped circles, arrows, etc.).
             AnnotationOverlay(
                 annotations: aiAnnotations,
                 snapshotBounds: aiBounds,
                 inkBounds: drawing.strokes.map(\.renderBounds)
             )
+            if showGrid {
+                CoordinateGrid(bounds: canvasBounds)
+            }
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { canvasSize = geo.size }
+                    .onChange(of: geo.size) { _, new in canvasSize = new }
+            }
+        )
         .ignoresSafeArea(edges: .bottom)
-        .onAppear { loadPersisted() }
+        .onAppear {
+            loadPersisted()
+            // End Session must kill EVERYTHING in flight — including a
+            // drawing animation that would otherwise keep painting after
+            // the connection is gone. Bind the player directly (not via
+            // self.aiPlayer) so the closure stored on liveSession doesn't
+            // capture the view struct and its @State storage — that read
+            // back as a retain cycle keeping the whole page graph alive.
+            let player = aiPlayer
+            liveSession.onSessionEnded = { [weak player] in
+                player?.cancelPlayback()
+            }
+        }
+        // Page swiped away or notebook closed: end the live session. Its
+        // snapshot provider is bound to THIS page, so leaving it running
+        // would stream a stale page to the model — and previously also
+        // leaked the socket and mic (nothing ever stopped them).
+        .onDisappear { liveSession.stop() }
         .onChange(of: drawing) { _, newValue in
             page.drawingData = newValue.dataRepresentation()
+            liveSession.noteCanvasChanged()      // NEW
         }
+        
         .overlay(alignment: .topTrailing) {
             HStack(spacing: 8) {
                 Button {
@@ -153,11 +214,9 @@ struct PageEditor: View {
                         .padding(.vertical, 8)
                         .background(.regularMaterial, in: Capsule())
                 }
-                if !aiAnnotations.isEmpty {
+                if hasAIContent {
                     Button {
-                        aiAnnotations = []
-                        aiBounds = .zero
-                        page.annotationData = Data()   // clear persistence too
+                        clearAllAIContent()
                     } label: {
                         Label("Clear AI", systemImage: "eraser")
                             .padding(.horizontal, 12)
@@ -168,11 +227,15 @@ struct PageEditor: View {
                 Button {
                     showTutor = true
                 } label: {
-                    Label("Tutor", systemImage: "sparkles")
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(.tint, in: Capsule())
-                        .foregroundStyle(.white)
+                    HStack(spacing: 6) {
+                        Image(systemName: isLiveSession ? "waveform.circle.fill" : "sparkles")
+                            .symbolEffect(.pulse, options: .repeating, isActive: isLiveSession)
+                        Text(isLiveSession ? "Live" : "Tutor")
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(isLiveSession ? Color.red : Color.accentColor, in: Capsule())
+                    .foregroundStyle(.white)
                 }
             }
             .padding()
@@ -180,18 +243,33 @@ struct PageEditor: View {
         .sheet(isPresented: $showTutor) {
             TutorPanel(
                 captureSnapshot: snapshot,
-                onAnnotations: { anns, bounds in
-                    aiBounds = bounds
-                    aiAnnotations = anns
-                    saveAnnotations()
+                canvasBounds: { canvasBounds },
+                onDrawAction: { drawings, bounds in
+                    guard !drawings.isEmpty else { return }
+                    // Student ink: snap targets for "circle the answer"
+                    // loops and keep-out zones for explanation text.
+                    let ink = drawing.strokes.map(\.renderBounds)
+                    // Keep-out for the Grid / Clear AI / Tutor buttons.
+                    let controls = CGRect(x: max(bounds.minX, bounds.maxX - 420),
+                                          y: bounds.minY, width: 420, height: 64)
+                    Task {
+                        await aiPlayer.play(actions: drawings, canvasBounds: bounds,
+                                            userInk: ink, avoidRects: [controls])
+                        saveAIDrawing()
+                        // Ship a frame NOW so the model sees its own ink
+                        // land instead of waiting for the next heartbeat.
+                        liveSession.noteAIDrawingFinished()
+                    }
                 },
-                initialMessages: loadMessages(),
-                onMessagesChanged: { saveMessages($0) }
+                session: liveSession
             )
+            .presentationDetents([.fraction(0.45), .large])   // NEW
+            .presentationDragIndicator(.visible)              // NEW
+
         }
     }
 
-    // MARK: - Persistence (JSON blobs on the Page, like drawingData)
+    // MARK: - Persistence
 
     private func loadPersisted() {
         if !page.drawingData.isEmpty,
@@ -203,42 +281,99 @@ struct PageEditor: View {
             aiAnnotations = stored.annotations
             aiBounds = stored.bounds
         }
+        if !page.aiDrawingData.isEmpty,
+           let stored = try? JSONDecoder()
+            .decode(StoredAIDrawing.self, from: page.aiDrawingData),
+           let pk = try? PKDrawing(data: stored.pkDrawingBytes) {
+            aiPlayer.loadCommitted(drawing: pk, labels: stored.labels)
+        }
     }
 
     private func saveAnnotations() {
-        let stored = StoredAnnotations(annotations: aiAnnotations,
-                                       bounds: aiBounds)
+        let stored = StoredAnnotations(annotations: aiAnnotations, bounds: aiBounds)
         page.annotationData = (try? JSONEncoder().encode(stored)) ?? Data()
     }
 
-    private func loadMessages() -> [TutorMessage] {
-        (try? JSONDecoder()
-            .decode([TutorMessage].self, from: page.chatData)) ?? []
+    private func saveAIDrawing() {
+        let stored = StoredAIDrawing(
+            pkDrawingBytes: aiPlayer.committedDrawing.dataRepresentation(),
+            labels: aiPlayer.labels
+        )
+        page.aiDrawingData = (try? JSONEncoder().encode(stored)) ?? Data()
     }
 
-    private func saveMessages(_ msgs: [TutorMessage]) {
-        page.chatData = (try? JSONEncoder().encode(msgs)) ?? Data()
+    private func clearAllAIContent() {
+        aiAnnotations = []
+        aiBounds = .zero
+        page.annotationData = Data()
+        aiPlayer.clear()
+        page.aiDrawingData = Data()
     }
 
-    // MARK: - Snapshot (white bg + grid, unchanged)
+    // MARK: - Snapshot (white bg + user ink + AI ink + AI labels + grid)
 
-    private func snapshot() -> CanvasSnapshot? {
-        let bounds = snapshotBounds
-        let strokeImage = drawing.image(from: bounds, scale: 2.0)
-        let size = strokeImage.size
-        let renderer = UIGraphicsImageRenderer(size: size)
-        let composited = renderer.image { ctx in
-            UIColor.white.setFill()
-            ctx.fill(CGRect(origin: .zero, size: size))
-            strokeImage.draw(in: CGRect(origin: .zero, size: size))
-            drawGrid(in: ctx.cgContext, size: size)
+    private func snapshot() -> UIImage? {
+        let bounds = canvasBounds
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+
+        // Cap the longest side at ~1024 actual pixels. Gemini Live silently
+        // DROPS oversized frames (verified against the API: a 3280x4400
+        // frame yields "I cannot see your screen", 764x1024 reads fine),
+        // and ~1k px is plenty to read handwriting. format.scale = 1 is
+        // load-bearing: the default is the device scale, which would
+        // multiply the pixel count by 4-9x behind our back.
+        let maxSide: CGFloat = 1024
+        let scale = min(1.0, maxSide / max(bounds.width, bounds.height))
+        let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+
+        // Render under LIGHT appearance no matter the device theme:
+        // PencilKit re-tints ink for dark mode at render time, so a
+        // dark-mode user's (visually white) strokes would land white on
+        // this white background and the model would see a blank page.
+        var image: UIImage?
+        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+            image = renderer.image { ctx in
+                UIColor.white.setFill()
+                ctx.fill(CGRect(origin: .zero, size: size))
+
+                // User's strokes.
+                drawing.image(from: bounds, scale: scale)
+                    .draw(in: CGRect(origin: .zero, size: size))
+
+                // AI's strokes (so the model can see what it already drew).
+                aiPlayer.committedDrawing.image(from: bounds, scale: scale)
+                    .draw(in: CGRect(origin: .zero, size: size))
+
+                // AI text labels.
+                for label in aiPlayer.labels {
+                    let attrs: [NSAttributedString.Key: Any] = [
+                        .font: UIFont.systemFont(ofSize: 16 * scale, weight: .semibold),
+                        .foregroundColor: AIPalette.uiColor(label.color)
+                    ]
+                    let str = NSAttributedString(string: label.text, attributes: attrs)
+                    let strSize = str.size()
+                    let pos = CGPoint(
+                        x: (label.canvasX - bounds.minX) * scale - strSize.width / 2,
+                        y: (label.canvasY - bounds.minY) * scale - strSize.height / 2
+                    )
+                    str.draw(at: pos)
+                }
+
+                drawGrid(in: ctx.cgContext, size: size)
+            }
         }
-        return CanvasSnapshot(image: composited, bounds: bounds)
+        return image
     }
 
     private func drawGrid(in cg: CGContext, size: CGSize) {
         let steps = 10
-        let font = UIFont.systemFont(ofSize: 11, weight: .semibold)
+        // 14pt in a ~1024px frame — the model must be able to READ the
+        // coordinate labels or the grid is dead weight in every frame.
+        let font = UIFont.systemFont(ofSize: 14, weight: .semibold)
         let labelAttrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: UIColor.systemBlue.withAlphaComponent(0.9)

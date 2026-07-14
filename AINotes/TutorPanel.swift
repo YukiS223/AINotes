@@ -2,184 +2,191 @@
 //  TutorPanel.swift
 //  AINotes
 //
+//  Live-session UI. One big Start/Stop button, a status indicator, and
+//  an optional rolling transcript of what the model is saying. No more
+//  mic button, no more send button — opening this sheet IS the
+//  screensharing session.
+//
+
 import SwiftUI
-import PencilKit
-
-@MainActor
-@Observable
-final class TutorViewModel {
-    var messages: [TutorMessage] = []
-    var isLoading: Bool = false
-    var errorText: String?
-
-    private let client = LLMClient()
-
-    func askAboutCanvas(image: UIImage,
-                        userQuestion: String) async -> [AnnotationDTO]? {
-        isLoading = true
-        errorText = nil
-        defer { isLoading = false }
-
-        let userText = userQuestion.isEmpty ? "(Screenshot sent)" : userQuestion
-        messages.append(.init(role: .user, text: userText))
-
-        let history = Array(messages.dropLast())
-
-        do {
-            let result = try await client.askAboutCanvas(
-                image: image,
-                userQuestion: userQuestion,
-                history: history
-            )
-            messages.append(.init(role: .assistant, text: result.reply))
-            return result.annotations
-        } catch {
-            errorText = error.localizedDescription
-            return nil
-        }
-    }
-}
-
-struct TutorMessage: Identifiable, Codable {
-    enum Role: String, Codable { case user, assistant }
-    let id = UUID()
-    let role: Role
-    let text: String
-
-    // `id` is in-memory identity for SwiftUI's ForEach, not saved data.
-    // Excluding it from CodingKeys silences the warning and stops a
-    // saved id from being (pointlessly) re-generated on decode.
-    private enum CodingKeys: String, CodingKey {
-        case role, text
-    }
-}
 
 struct TutorPanel: View {
-    let captureSnapshot: () -> CanvasSnapshot?
-    let onAnnotations: ([AnnotationDTO], CGRect) -> Void
-    // Persisted thread for this page, and a way to report changes back.
-    let initialMessages: [TutorMessage]
-    let onMessagesChanged: ([TutorMessage]) -> Void
+    let captureSnapshot: () -> UIImage?
+    let canvasBounds: () -> CGRect
+    let onDrawAction: ([DrawingActionDTO], CGRect) -> Void
 
-    @State private var vm = TutorViewModel()
-    @State private var userInput: String = ""
-    @State private var didSeed = false
+
+    let session: LiveSession
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 12) {
-                            ForEach(vm.messages) { msg in
-                                MessageBubble(message: msg).id(msg.id)
-                            }
-                            if vm.isLoading {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                    Text("Thinking…").foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal)
-                            }
-                            if let err = vm.errorText {
-                                Text(err)
-                                    .foregroundStyle(.red)
-                                    .padding(.horizontal)
-                            }
-                        }
-                        .padding(.vertical)
-                    }
-                    .onChange(of: vm.messages.count) { _, _ in
-                        if let last = vm.messages.last {
-                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                        }
-                    }
+            VStack(spacing: 24) {
+                Spacer()
+
+                statusIndicator
+                    .frame(height: 120)
+
+                transcriptArea
+
+                // Live proof that screen share is working: the exact last
+                // frame shipped to the model, plus send/tool counters.
+                if isLive || session.framesSent > 0 {
+                    lastFramePreview
                 }
 
-                Divider()
+                Spacer()
 
-                VStack(spacing: 4) {
-                    HStack(spacing: 8) {
-                        TextField("Ask a question (optional)",
-                                  text: $userInput, axis: .vertical)
-                            .textFieldStyle(.roundedBorder)
-                            .lineLimit(1...4)
-                            .submitLabel(.send)
-                            .onSubmit { sendSnapshot() }
+                primaryButton
 
-                        Button {
-                            sendSnapshot()
-                        } label: {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.system(size: 32))
-                                .foregroundStyle(vm.isLoading ? Color.gray : Color.accentColor)
-                        }
-                        .disabled(vm.isLoading)
-                    }
-                    Text("Send captures a fresh screenshot with your question.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding()
+                Text(captionText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 24)
             }
+            .padding(.horizontal, 24)
             .navigationTitle("AI Tutor")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
+                    Button("Close") {
+                        dismiss()
+                    }
                 }
             }
-            // Load the saved thread the first time the sheet opens.
             .onAppear {
-                if !didSeed {
-                    vm.messages = initialMessages
-                    didSeed = true
-                }
-            }
-            // Persist whenever a turn is added (messages only ever append).
-            .onChange(of: vm.messages.count) { _, _ in
-                if didSeed { onMessagesChanged(vm.messages) }
+                session.snapshotProvider = captureSnapshot
+                session.canvasBoundsProvider = canvasBounds
+                session.onDrawAction = onDrawAction
             }
         }
     }
 
-    private func sendSnapshot() {
-        guard !vm.isLoading else { return }
-        guard let snap = captureSnapshot() else {
-            vm.errorText = "Couldn't capture the canvas."
-            return
-        }
-        let question = userInput
-        userInput = ""
-        Task {
-            if let anns = await vm.askAboutCanvas(image: snap.image,
-                                                  userQuestion: question) {
-                onAnnotations(anns, snap.bounds)
-            }
+    // MARK: - Subviews
+
+    private var statusIndicator: some View {
+        ZStack {
+            Circle()
+                .fill(circleColor.opacity(0.18))
+                .frame(width: 120, height: 120)
+                .scaleEffect(isLive ? 1.1 : 1.0)
+                .animation(
+                    isLive
+                        ? .easeInOut(duration: 1.0).repeatForever(autoreverses: true)
+                        : .default,
+                    value: isLive
+                )
+            Image(systemName: iconName)
+                .font(.system(size: 44, weight: .regular))
+                .foregroundStyle(circleColor)
         }
     }
-}
 
-private struct MessageBubble: View {
-    let message: TutorMessage
-    var body: some View {
-        HStack {
-            if message.role == .assistant {
-                Text(message.text)
-                    .padding(10)
-                    .background(.gray.opacity(0.15),
-                                in: RoundedRectangle(cornerRadius: 12))
-                Spacer(minLength: 40)
+
+    private var transcriptArea: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(session.transcript.isEmpty ? " " : session.transcript)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+                    .id("transcriptEnd")
+                    .onChange(of: session.transcript) { _, _ in
+                        proxy.scrollTo("transcriptEnd", anchor: .bottom)
+                    }
+            }
+            .frame(maxHeight: 220)
+            .background(.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private var primaryButton: some View {
+        Button {
+            toggleSession()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: isLive ? "stop.circle.fill" : "play.circle.fill")
+                    .font(.system(size: 22))
+                Text(isLive ? "End Session" : "Start Live Session")
+                    .font(.headline)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity)
+            .background(isLive ? Color.red : Color.accentColor, in: Capsule())
+            .foregroundStyle(.white)
+        }
+        .disabled(isStarting)
+    }
+
+    // MARK: - Derived
+
+    private var isLive: Bool {
+        if case .live = session.state { return true }
+        return false
+    }
+    private var isStarting: Bool {
+        if case .starting = session.state { return true }
+        return false
+    }
+
+    private var iconName: String {
+        switch session.state {
+        case .idle:       return "mic.slash"
+        case .starting:   return "ellipsis"
+        case .live:       return "waveform"
+        case .error:      return "exclamationmark.triangle"
+        }
+    }
+    private var circleColor: Color {
+        switch session.state {
+        case .idle:       return .gray
+        case .starting:   return .orange
+        case .live:       return .accentColor
+        case .error:      return .red
+        }
+    }
+    private var captionText: String {
+        switch session.state {
+        case .idle:
+            return "Tap Start to begin a live conversation. The tutor will see your canvas and hear you."
+        case .starting:
+            return "Connecting…"
+        case .live:
+            return "Live. The tutor can see and hear you. Speak naturally."
+        case .error(let m):
+            return m
+        }
+    }
+
+    private func toggleSession() {
+        if isLive {
+            session.stop()
+        } else if !isStarting {
+            // Works from .idle and from .error (retry after a failure).
+            session.start(apiKey: Secrets.geminiAPIKey)
+        }
+    }
+    private var lastFramePreview: some View {
+        VStack(spacing: 4) {
+            if let img = session.lastFrameSent {
+                Image(uiImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxHeight: 120)
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.gray.opacity(0.4), lineWidth: 1))
             } else {
-                Spacer(minLength: 40)
-                Text(message.text)
-                    .padding(10)
-                    .foregroundStyle(.white)
-                    .background(.tint, in: RoundedRectangle(cornerRadius: 12))
+                Text("No frames sent yet")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxHeight: 120)
             }
+            Text("Frames: \(session.framesSent)  ·  Tools: \(session.toolCallsReceived)  ·  Extracted: \(session.drawingsExtracted)  ·  Drew: \(session.drawingsDispatched)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
         }
-        .padding(.horizontal)
     }
 }

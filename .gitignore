@@ -1,5 +1,6 @@
 # Secrets — never commit
 **/Secrets.plist
+**/secrets.plist
 
 # macOS
 .DS_Store

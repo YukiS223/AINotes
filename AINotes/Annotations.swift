@@ -28,7 +28,8 @@ extension AnnotationDTO {
         case "orange": return .orange
         case "yellow": return .yellow
         case "purple": return .purple
-        case "black":  return .black
+        // Not real black: invisible on the canvas in dark mode.
+        case "black":  return Color(.systemIndigo)
         default:       return .red
         }
     }
