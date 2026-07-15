@@ -51,6 +51,9 @@ final class AIDrawingPlayer {
     private(set) var inProgressStroke: PKStroke?
     /// Text labels (committed only; rendered via a separate Canvas overlay).
     private(set) var labels: [StoredAILabel] = []
+    /// Inflated bounds of structured AI content such as plots and trees.
+    /// Thin axes/curves alone do not communicate that their interior is in use.
+    private(set) var reservedRects: [CGRect] = []
     /// True while play() is running. Subsequent play() calls are queued
     /// implicitly by the caller awaiting.
     private(set) var isPlaying = false
@@ -74,14 +77,19 @@ final class AIDrawingPlayer {
     }
 
     /// Hydrate from persistence without animating.
-    func loadCommitted(drawing: PKDrawing, labels: [StoredAILabel]) {
+    func loadCommitted(drawing: PKDrawing, labels: [StoredAILabel],
+                       reservedRects: [CGRect] = []) {
         committedDrawing = drawing
         self.labels = labels
+        self.reservedRects = reservedRects
         inProgressStroke = nil
-        // Rebuild what anchors we can: node/tree labels were persisted as
-        // text labels at the node centers, so "id:LABEL" edge references
-        // keep working after an app relaunch instead of silently failing.
-        for label in labels {
+        // Rebuild what anchors we can: legacy node/tree labels were persisted
+        // as unsized plain-text labels at their centers. Equations have a
+        // format and plot labels have an explicit size, so excluding both
+        // prevents a plot tick such as "2" from overwriting the persisted
+        // tree-node anchor named "2" after relaunch. The nil/nil test keeps
+        // existing saved node and tree labels backward compatible.
+        for label in labels where label.format == nil && label.fontSize == nil {
             nodeAnchors[label.text] = CGPoint(x: label.canvasX, y: label.canvasY)
         }
     }
@@ -96,6 +104,7 @@ final class AIDrawingPlayer {
         committedDrawing = PKDrawing()
         inProgressStroke = nil
         labels = []
+        reservedRects = []
         nodeAnchors = [:]
     }
 
@@ -111,11 +120,16 @@ final class AIDrawingPlayer {
         // post-clear value and think it's fresh — this stamp is what marks
         // it stale.
         let gen = playGeneration
+        let outcomeTicket = DrawingDispatchOutcomeBroker.shared.claim(
+            actions: actions,
+            bounds: canvasBounds
+        )
         let prev = playTail
         let task = Task { [weak self] in
             _ = await prev?.value
             await self?.runPlay(actions: actions, canvasBounds: canvasBounds,
-                                userInk: userInk, avoidRects: avoidRects, gen: gen)
+                                userInk: userInk, avoidRects: avoidRects, gen: gen,
+                                outcomeTicket: outcomeTicket)
         }
         playTail = task
         await task.value
@@ -133,58 +147,88 @@ final class AIDrawingPlayer {
     }
 
     private func runPlay(actions: [DrawingActionDTO], canvasBounds: CGRect,
-                         userInk: [CGRect], avoidRects: [CGRect], gen: Int) async {
+                         userInk: [CGRect], avoidRects: [CGRect], gen: Int,
+                         outcomeTicket: UUID?) async {
         // A play cancelled or invalidated while still queued behind the
         // previous one must not execute AT ALL — especially not the
         // tree-wipe below, which would erase committed ink and then draw
         // nothing. `gen` was stamped when play() enqueued this task.
-        guard !Task.isCancelled, gen == playGeneration else { return }
+        guard !Task.isCancelled, gen == playGeneration else {
+            DrawingDispatchOutcomeBroker.shared.finish(
+                outcomeTicket,
+                outcome: DrawingDispatchOutcome(
+                    requestedCount: actions.count,
+                    renderedCount: 0,
+                    skippedCount: actions.count,
+                    failureReason: "drawing was cancelled before placement"
+                )
+            )
+            return
+        }
         isPlaying = true
         defer { isPlaying = false }
 
-        // A new `tree` REPLACES any existing tree — clear prior AI ink first
-        // so revisions don't pile on top of each other. Non-tree primitives
-        // (node, edge, path, text) remain additive. Only wipe for a tree
-        // that can actually render (has nodes and a root): validation
-        // upstream should guarantee this, but a dud tree must never
-        // vaporize existing ink and leave a blank layer.
-        let hasRenderableTree = actions.contains { a in
-            guard a.type == .tree, let nodes = a.nodes, !nodes.isEmpty else { return false }
-            return nodes.contains { $0.parent == nil }
-        }
-        if hasRenderableTree {
-            committedDrawing = PKDrawing()
-            labels = []
-            nodeAnchors = [:]
-        }
+        // Tree content is additive like every other primitive. Earlier code
+        // cleared the entire AI layer before it even knew whether the new tree
+        // had a collision-free placement, which could erase unrelated plots,
+        // equations, and labels and then render nothing. Scoped replacement
+        // requires per-action stroke ownership; until that exists, preserving
+        // all prior content is the only lossless behavior.
 
-        // Relocate explanation text away from occupied space: student ink,
-        // caller-supplied keep-out zones, and OUR OWN surviving content
-        // (computed after the tree-wipe above so freshly-cleared ink
-        // doesn't count as occupied).
-        var occupied = userInk + avoidRects
+        // Relocate generated content away from student ink, caller-supplied
+        // keep-out zones, and all surviving AI content.
+        var occupied = userInk + avoidRects + reservedRects
         occupied += committedDrawing.strokes.map(\.renderBounds)
-        occupied += labels.map { l in
-            let w = CGFloat(l.text.count) * 9.5 + 8
-            return CGRect(x: l.canvasX - Double(w) / 2, y: l.canvasY - 11,
-                          width: Double(w), height: 22)
+        occupied += labels.map(AILabelLayout.rect)
+        let placement = TextBlockPlacer.adjust(actions,
+                                               canvasBounds: canvasBounds,
+                                               avoid: occupied)
+        if placement.skippedCount > 0 {
+            print("📐 placement omitted \(placement.skippedCount) action(s): no collision-free canvas space")
         }
-        let placed = TextBlockPlacer.adjust(actions,
-                                            canvasBounds: canvasBounds,
-                                            avoid: occupied)
 
         let expander = ActionExpander(canvasBounds: canvasBounds,
                                       initialAnchors: nodeAnchors,
                                       inkBounds: userInk)
-        let steps = expander.expand(placed)
+        let expansion = expander.expandReporting(placement.actions)
+        let steps = expansion.steps
+        let expansionSkipped = placement.actions.count
+            - expansion.renderedActionCount
+        let totalSkipped = placement.skippedCount + expansionSkipped
+        DrawingDispatchOutcomeBroker.shared.finish(
+            outcomeTicket,
+            outcome: DrawingDispatchOutcome(
+                requestedCount: actions.count,
+                renderedCount: expansion.renderedActionCount,
+                skippedCount: totalSkipped,
+                failureReason: expansion.renderedActionCount == 0
+                    ? "no action had collision-free renderable output"
+                    : nil
+            )
+        )
 
         for step in steps {
             guard !Task.isCancelled, gen == playGeneration else { return }
             switch step {
             case .stroke(let points, let color):
                 await animateStroke(points: points, color: color, gen: gen)
+            case .strokeGroup(let paths, let color, let thickness):
+                appendStrokeGroup(paths: paths, color: color, thickness: thickness)
+                try? await Task.sleep(nanoseconds: 60_000_000)
             case .label(let at, let text, let color):
                 appendLabel(at: at, text: text, color: color)
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            case .proseLabel(let at, let text, let color, let fontSize):
+                appendProseLabel(at: at, text: text, color: color,
+                                 fontSize: fontSize)
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            case .sizedLabel(let at, let text, let color, let fontSize):
+                appendLabel(at: at, text: text, color: color,
+                            fontSize: fontSize)
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            case .mathLabel(let at, let latex, let color, let fontSize):
+                appendMathLabel(at: at, latex: latex, color: color,
+                                fontSize: fontSize)
                 try? await Task.sleep(nanoseconds: 80_000_000)
             }
         }
@@ -192,6 +236,7 @@ final class AIDrawingPlayer {
         // Skip on cancellation (Clear AI / End Session) — the anchors were
         // reset and restoring the expander's would resurrect stale state.
         guard !Task.isCancelled, gen == playGeneration else { return }
+        reservedRects.append(contentsOf: placement.reservedRects)
         nodeAnchors = expander.finalAnchors
     }
 
@@ -229,13 +274,52 @@ final class AIDrawingPlayer {
         inProgressStroke = nil
     }
 
-    private func appendLabel(at: CGPoint, text: String, color: UIColor) {
+    private func appendLabel(at: CGPoint, text: String, color: UIColor,
+                             fontSize: CGFloat? = nil) {
         labels.append(StoredAILabel(
             canvasX: Double(at.x),
             canvasY: Double(at.y),
             text: text,
-            color: AIPalette.name(for: color)
+            color: AIPalette.name(for: color),
+            fontSize: fontSize.map(Double.init)
         ))
+    }
+
+    private func appendMathLabel(at: CGPoint, latex: String,
+                                 color: UIColor, fontSize: CGFloat) {
+        labels.append(StoredAILabel(
+            canvasX: Double(at.x),
+            canvasY: Double(at.y),
+            text: latex,
+            color: AIPalette.name(for: color),
+            format: "latex",
+            fontSize: Double(fontSize)
+        ))
+    }
+
+    private func appendProseLabel(at: CGPoint, text: String,
+                                  color: UIColor, fontSize: CGFloat) {
+        labels.append(StoredAILabel(
+            canvasX: Double(at.x),
+            canvasY: Double(at.y),
+            text: text,
+            color: AIPalette.name(for: color),
+            fontSize: Double(fontSize),
+            alignment: "leading"
+        ))
+    }
+
+    private func appendStrokeGroup(paths: [[CGPoint]], color: UIColor,
+                                   thickness: CGFloat) {
+        let newStrokes = paths.compactMap { points -> PKStroke? in
+            guard points.count >= 2 else { return nil }
+            return AIStrokeFactory.stroke(points: points, color: color,
+                                          thickness: thickness)
+        }
+        guard !newStrokes.isEmpty else { return }
+        var strokes = committedDrawing.strokes
+        strokes.append(contentsOf: newStrokes)
+        committedDrawing = PKDrawing(strokes: strokes)
     }
 }
 
@@ -279,13 +363,24 @@ struct AILabelsOverlay: View {
     var body: some View {
         Canvas { ctx, _ in
             for l in labels {
-                ctx.draw(
-                    Text(l.text)
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(AIPalette.color(l.color)),
-                    at: CGPoint(x: l.canvasX, y: l.canvasY),
-                    anchor: .center
-                )
+                let point = CGPoint(x: l.canvasX, y: l.canvasY)
+                if l.format == "latex" {
+                    let image = MathLabelRenderer.image(
+                        latex: l.text,
+                        color: AIPalette.uiColor(l.color),
+                        fontSize: CGFloat(l.fontSize ?? 22),
+                        scale: 2
+                    )
+                    ctx.draw(Image(uiImage: image), at: point, anchor: .center)
+                } else {
+                    let image = AILabelLayout.plainImage(
+                        text: l.text,
+                        color: AIPalette.uiColor(l.color),
+                        fontSize: CGFloat(l.fontSize ?? 16),
+                        leading: l.alignment == "leading"
+                    )
+                    ctx.draw(Image(uiImage: image), at: point, anchor: .center)
+                }
             }
         }
         .allowsHitTesting(false)

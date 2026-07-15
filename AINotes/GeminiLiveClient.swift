@@ -348,7 +348,8 @@ struct SetupConfig {
                         "properties": [
                             "type": [
                                 "type": "string",
-                                "enum": ["path", "text", "node", "edge", "tree"],
+                                "enum": ["path", "text", "equation", "plot",
+                                         "node", "edge", "tree"],
                                 "description": "Which primitive this is."
                             ],
                             "x": ["type": "number", "description": "Fractional x (0-1)."],
@@ -363,6 +364,70 @@ struct SetupConfig {
                                 "enum": ["red","blue","green","orange","purple"]
                             ],
                             "text": ["type": "string"],
+                            "latex": [
+                                "type": "string",
+                                "description": "TeX math for an equation action, e.g. \\int_0^{2\\pi} r\\,dr."
+                            ],
+                            "plot": [
+                                "type": "object",
+                                "description": "Deterministic mathematical or data plot specification.",
+                                "properties": [
+                                    "kind": [
+                                        "type": "string",
+                                        "enum": ["function", "parametric", "implicit",
+                                                 "line", "scatter", "bar", "histogram",
+                                                 "disk"]
+                                    ],
+                                    "expression": [
+                                        "type": "string",
+                                        "description": "Function y=f(x), or implicit relation/expression such as x^2+y^2<=4."
+                                    ],
+                                    "xExpression": ["type": "string"],
+                                    "yExpression": ["type": "string"],
+                                    "rightExpression": ["type": "string"],
+                                    "relation": [
+                                        "type": "string",
+                                        "enum": ["eq", "lte", "gte"]
+                                    ],
+                                    "points": [
+                                        "type": "array",
+                                        "items": [
+                                            "type": "array",
+                                            "items": ["type": "number"]
+                                        ]
+                                    ],
+                                    "values": [
+                                        "type": "array",
+                                        "items": ["type": "number"]
+                                    ],
+                                    "binCount": ["type": "integer"],
+                                    "centerX": ["type": "number"],
+                                    "centerY": ["type": "number"],
+                                    "radius": ["type": "number"],
+                                    "sampleCount": ["type": "integer"],
+                                    "fill": ["type": "boolean"],
+                                    "equalScale": [
+                                        "type": "boolean",
+                                        "description": "Use equal x/y unit scale. Defaults true for implicit and disk plots."
+                                    ],
+                                    "title": ["type": "string"],
+                                    "xAxisLabel": ["type": "string"],
+                                    "yAxisLabel": ["type": "string"],
+                                    "domain": [
+                                        "type": "object",
+                                        "properties": [
+                                            "xMin": ["type": "number"],
+                                            "xMax": ["type": "number"],
+                                            "yMin": ["type": "number"],
+                                            "yMax": ["type": "number"],
+                                            "tMin": ["type": "number"],
+                                            "tMax": ["type": "number"]
+                                        ],
+                                        "required": ["xMin", "xMax", "yMin", "yMax"]
+                                    ]
+                                ],
+                                "required": ["kind"]
+                            ],
                             "points": [
                                 "type": "array",
                                 "items": [

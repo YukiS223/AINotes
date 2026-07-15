@@ -1,21 +1,231 @@
 import SwiftUI
 import PencilKit
 
-// One tool picker shared by every canvas in the app.
-// (Multiple pickers fighting is what caused the flicker.)
+// One picker is shared by the canvases in this app process. Only the explicitly
+// active page attaches to it, so a TabView swipe cannot make neighboring
+// pages fight over first responder or drift to different selected tools.
+@MainActor
 enum SharedToolPicker {
-    static let picker = PKToolPicker()
+    private static let lastInkIdentifierKey = "editor.lastInk.identifier.v1"
+    private static let lastInkWidthKey = "editor.lastInk.width.v1"
+    private static let lastInkColorKey = "editor.lastInk.color.v1"
+
+    private static var configuredIDs: Set<String> = []
+    private static var storedPicker: PKToolPicker?
+
+    static var lastInkItemIdentifier: String? =
+        UserDefaults.standard.string(forKey: lastInkIdentifierKey)
+
+    static var lastInkTool: PKInkingTool = {
+        let defaults = UserDefaults.standard
+        let identifier = defaults.string(forKey: lastInkIdentifierKey)
+        let type: PKInkingTool.InkType
+        switch identifier {
+        case EditorPickerItemID.pencil: type = .pencil
+        case EditorPickerItemID.marker: type = .marker
+        default: type = .pen
+        }
+
+        let widthNumber = defaults.object(forKey: lastInkWidthKey) as? NSNumber
+        let width = widthNumber.map { CGFloat(truncating: $0) } ?? 4
+        var color = UIColor.label
+        if let data = defaults.data(forKey: lastInkColorKey),
+           let restored = try? NSKeyedUnarchiver.unarchivedObject(
+               ofClass: UIColor.self,
+               from: data
+           ) {
+            color = restored
+        }
+        return PKInkingTool(type, color: color, width: max(1, width))
+    }()
+
+    /// Returns the process-wide picker, rebuilding only the picker (never its
+    /// canvas) when customization changes. The selected item is carried into
+    /// the replacement when it is still enabled.
+    static func picker(enabledIDs: Set<String>) -> PKToolPicker {
+        if let storedPicker, configuredIDs == enabledIDs { return storedPicker }
+
+        let previousIdentifier = storedPicker?.selectedToolItem.identifier
+        if let storedPicker { rememberSelectedInk(in: storedPicker) }
+
+        let replacement = EditorToolPickerFactory.make(enabledIDs: enabledIDs)
+        if let previousIdentifier,
+           let matchingItem = replacement.toolItems.first(where: {
+               $0.identifier == previousIdentifier
+           }) {
+            replacement.selectedToolItem = matchingItem
+        }
+        storedPicker = replacement
+        configuredIDs = enabledIDs
+        return replacement
+    }
+
+    static func rememberSelectedInk(in picker: PKToolPicker) {
+        guard let item = picker.selectedToolItem as? PKToolPickerInkingItem else { return }
+        lastInkItemIdentifier = item.identifier
+        lastInkTool = item.inkingTool
+
+        let defaults = UserDefaults.standard
+        defaults.set(item.identifier, forKey: lastInkIdentifierKey)
+        defaults.set(Double(item.inkingTool.width), forKey: lastInkWidthKey)
+        if let colorData = try? NSKeyedArchiver.archivedData(
+            withRootObject: item.inkingTool.color,
+            requiringSecureCoding: true
+        ) {
+            defaults.set(colorData, forKey: lastInkColorKey)
+        }
+    }
+
+    static func selectLasso(in picker: PKToolPicker) {
+        guard !(picker.selectedToolItem is PKToolPickerLassoItem),
+              let lasso = picker.toolItems.first(where: { $0 is PKToolPickerLassoItem }) else {
+            return
+        }
+        picker.selectedToolItem = lasso
+    }
+
+    @discardableResult
+    static func selectInk(in picker: PKToolPicker) -> Bool {
+        if picker.selectedToolItem is PKToolPickerInkingItem {
+            rememberSelectedInk(in: picker)
+            return true
+        }
+
+        let remembered = lastInkItemIdentifier.flatMap { identifier in
+            picker.toolItems.first(where: { $0.identifier == identifier })
+        }
+        guard let ink = remembered
+                ?? picker.toolItems.first(where: { $0 is PKToolPickerInkingItem }) else {
+            return false
+        }
+        picker.selectedToolItem = ink
+        rememberSelectedInk(in: picker)
+        return true
+    }
+}
+
+/// Imperative bridge for edit commands that must reach the active
+/// PKCanvasView first responder. PencilKit owns the lasso selection and its
+/// rich pasteboard representation; routing standard UIKit edit actions keeps
+/// copied handwriting as editable strokes instead of flattening it to an
+/// image.
+@MainActor
+final class CanvasController {
+    private weak var canvas: PKCanvasView?
+    private weak var picker: PKToolPicker?
+    private weak var textEditor: (any TextSelectionEditing)?
+    private var drawingDidChange: ((PKDrawing) -> Void)?
+
+    func attach(_ canvas: PKCanvasView,
+                picker: PKToolPicker,
+                drawingDidChange: @escaping (PKDrawing) -> Void) {
+        self.canvas = canvas
+        self.picker = picker
+        self.drawingDidChange = drawingDidChange
+        textEditor?.connectUndoManager(canvas.undoManager)
+    }
+
+    func attachTextEditor(_ textEditor: any TextSelectionEditing) {
+        self.textEditor = textEditor
+        textEditor.connectUndoManager(canvas?.undoManager)
+    }
+
+    func detach(_ canvas: PKCanvasView) {
+        guard self.canvas === canvas else { return }
+        textEditor?.connectUndoManager(nil)
+        self.canvas = nil
+        picker = nil
+        drawingDidChange = nil
+    }
+
+    func append(strokes: [PKStroke]) {
+        guard let canvas, !strokes.isEmpty else { return }
+        var allStrokes = canvas.drawing.strokes
+        allStrokes.append(contentsOf: strokes)
+        apply(PKDrawing(strokes: allStrokes), registeringUndo: true)
+    }
+
+    func currentShapeStyle() -> ShapeStrokeStyle {
+        let tool = SharedToolPicker.lastInkTool
+        return ShapeStrokeStyle(color: tool.color, width: max(2, tool.width))
+    }
+
+    func activateInk() {
+        canvas?.isDrawingEnabled = true
+        // Only the visible canvas may mutate the singleton picker. A paged
+        // TabView keeps neighboring canvases alive, and letting one of those
+        // select a tool can silently switch the page the user is editing.
+        if canvas?.isFirstResponder == true, let picker {
+            SharedToolPicker.selectInk(in: picker)
+        }
+    }
+
+    func undo() {
+        canvas?.undoManager?.undo()
+    }
+
+    func redo() {
+        canvas?.undoManager?.redo()
+    }
+
+    func copySelection() {
+        if textEditor?.copySelectedText() == true { return }
+        perform(#selector(UIResponderStandardEditActions.copy(_:)))
+    }
+
+    func cutSelection() {
+        if textEditor?.cutSelectedText() == true { return }
+        perform(#selector(UIResponderStandardEditActions.cut(_:)))
+    }
+
+    func paste() {
+        if textEditor?.pasteTextBox() == true { return }
+        perform(#selector(UIResponderStandardEditActions.paste(_:)))
+    }
+
+    func deleteSelection() {
+        if textEditor?.deleteSelectedText() == true { return }
+        perform(#selector(UIResponderStandardEditActions.delete(_:)))
+    }
+
+    func canvasInteractionBegan() {
+        textEditor?.deselectText()
+    }
+
+    private func perform(_ action: Selector) {
+        guard let canvas else { return }
+        canvas.becomeFirstResponder()
+        UIApplication.shared.sendAction(action, to: canvas, from: nil, for: nil)
+    }
+
+    private func apply(_ newDrawing: PKDrawing, registeringUndo: Bool) {
+        guard let canvas else { return }
+        let previous = canvas.drawing
+        if registeringUndo {
+            canvas.undoManager?.registerUndo(withTarget: self) { target in
+                target.apply(previous, registeringUndo: true)
+            }
+        }
+        canvas.drawing = newDrawing
+        drawingDidChange?(newDrawing)
+    }
 }
 
 struct CanvasView: UIViewRepresentable {
     @Binding var drawing: PKDrawing
+    @Binding var toolMode: CanvasToolMode
+    let controller: CanvasController
+    let enabledToolIDs: Set<String>
+    let isActive: Bool
+    let onRequestToolCustomization: () -> Void
 
     func makeUIView(context: Context) -> PKCanvasView {
         let canvas = PKCanvasView()
         canvas.drawing = drawing
         canvas.drawingPolicy = .anyInput
         canvas.delegate = context.coordinator
-        canvas.backgroundColor = .systemBackground
+        canvas.backgroundColor = .clear
+        canvas.isOpaque = false
         // Pin the coordinate space: no scrolling, no automatic safe-area
         // content inset, no zoom. The AI overlay canvas and the snapshot
         // pipeline both assume this drawing's (0,0) is exactly the view's
@@ -29,6 +239,8 @@ struct CanvasView: UIViewRepresentable {
         canvas.minimumZoomScale = 1.0
         canvas.maximumZoomScale = 1.0
         context.coordinator.canvas = canvas
+        context.coordinator.connect(controller: controller)
+        context.coordinator.applyToolMode()
 
         // Do NOT grab focus or attach the picker here. In a paged TabView
         // several canvases are created up-front (current + neighbors);
@@ -42,9 +254,13 @@ struct CanvasView: UIViewRepresentable {
     }
 
     func updateUIView(_ canvas: PKCanvasView, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.replacePickerIfNeeded(enabledIDs: enabledToolIDs)
+        context.coordinator.connect(controller: controller)
         if canvas.drawing != drawing {
             canvas.drawing = drawing
         }
+        context.coordinator.applyToolMode()
         // Re-evaluate on every SwiftUI update (these fire during a swipe),
         // but the gate inside only lets the on-screen canvas act.
         DispatchQueue.main.async {
@@ -56,11 +272,117 @@ struct CanvasView: UIViewRepresentable {
         Coordinator(self)
     }
 
-    class Coordinator: NSObject, PKCanvasViewDelegate {
+    static func dismantleUIView(_ canvas: PKCanvasView,
+                                coordinator: Coordinator) {
+        coordinator.deactivatePicker()
+        coordinator.controller?.detach(canvas)
+        canvas.delegate = nil
+    }
+
+    class Coordinator: NSObject, PKCanvasViewDelegate, PKToolPickerObserver {
         var parent: CanvasView
         weak var canvas: PKCanvasView?
+        weak var controller: CanvasController?
+        private var isSynchronizingTool = false
+        private var appliedToolMode: CanvasToolMode?
+        private var isObservingToolPicker = false
+        private var isCanvasAttachedToPicker = false
+        private var needsPickerStateSync = true
+        private var pickerAccessoryItem: UIBarButtonItem?
+        private var picker: PKToolPicker
 
-        init(_ parent: CanvasView) { self.parent = parent }
+        init(_ parent: CanvasView) {
+            self.parent = parent
+            picker = SharedToolPicker.picker(enabledIDs: parent.enabledToolIDs)
+        }
+
+        /// Tool membership is immutable on PKToolPicker, so customization
+        /// replaces the shared picker while retaining the PKCanvasView and
+        /// its undo manager. Every coordinator detaches from the exact old
+        /// picker before adopting the replacement.
+        func replacePickerIfNeeded(enabledIDs: Set<String>) {
+            let replacement = SharedToolPicker.picker(enabledIDs: enabledIDs)
+            guard replacement !== picker else { return }
+
+            deactivatePicker(resignFirstResponder: false)
+            picker = replacement
+            appliedToolMode = nil
+            needsPickerStateSync = true
+
+            if let canvas, let controller {
+                controller.attach(canvas, picker: picker) { [weak self] newDrawing in
+                    self?.parent.drawing = newDrawing
+                }
+            }
+        }
+
+        func connect(controller: CanvasController) {
+            self.controller = controller
+            guard let canvas else { return }
+            controller.attach(canvas, picker: picker) { [weak self] newDrawing in
+                self?.parent.drawing = newDrawing
+            }
+        }
+
+        func applyToolMode() {
+            guard let canvas else { return }
+            // On first activation or after picker customization, the shared
+            // picker's selected item is authoritative. Waiting for the focus
+            // synchronization avoids replacing a restored eraser/lasso with
+            // the page's stale `.ink` state.
+            guard !needsPickerStateSync else { return }
+            guard appliedToolMode != parent.toolMode else { return }
+            isSynchronizingTool = true
+            defer { isSynchronizingTool = false }
+
+            switch parent.toolMode {
+            case .ink:
+                canvas.isDrawingEnabled = true
+                if canvas.isFirstResponder {
+                    SharedToolPicker.selectInk(in: picker)
+                }
+            case .selection:
+                canvas.isDrawingEnabled = true
+                if canvas.isFirstResponder {
+                    SharedToolPicker.selectLasso(in: picker)
+                }
+            case .shape, .text:
+                // SwiftUI's object overlays own touches in these modes, but
+                // the canvas stays first responder for undo and clipboard.
+                canvas.isDrawingEnabled = false
+            }
+            appliedToolMode = parent.toolMode
+        }
+
+        func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
+            guard !isSynchronizingTool, canvas?.isFirstResponder == true else { return }
+            applySelectedPickerItem(toolPicker.selectedToolItem)
+        }
+
+        private func applySelectedPickerItem(_ item: PKToolPickerItem) {
+            guard let canvas else { return }
+            if item is PKToolPickerLassoItem {
+                canvas.isDrawingEnabled = true
+                appliedToolMode = .selection
+                if parent.toolMode != .selection { parent.toolMode = .selection }
+            } else if item.identifier == EditorPickerItemID.text {
+                canvas.isDrawingEnabled = false
+                appliedToolMode = .text
+                if parent.toolMode != .text { parent.toolMode = .text }
+            } else if let shape = EditorPickerItemID.shapeKind(for: item.identifier) {
+                canvas.isDrawingEnabled = false
+                let mode = CanvasToolMode.shape(shape)
+                appliedToolMode = mode
+                if parent.toolMode != mode { parent.toolMode = mode }
+            } else {
+                if item is PKToolPickerInkingItem {
+                    SharedToolPicker.rememberSelectedInk(in: picker)
+                }
+                canvas.isDrawingEnabled = true
+                appliedToolMode = .ink
+                if parent.toolMode != .ink { parent.toolMode = .ink }
+            }
+        }
 
         // Only the canvas that is genuinely visible on screen attaches the
         // shared picker and becomes first responder. Off-screen neighbor
@@ -70,28 +392,106 @@ struct CanvasView: UIViewRepresentable {
         func claimFocusIfOnscreen() {
             guard let canvas else { return }
 
+            // Geometry alone is insufficient during an interactive page
+            // swipe because both pages intersect the window. NotebookView's
+            // selection is the single source of active-page ownership.
+            guard parent.isActive else {
+                deactivatePicker()
+                return
+            }
+
             // Must be in a window at all.
-            guard let window = canvas.window else { return }
+            guard let window = canvas.window else {
+                deactivatePicker()
+                return
+            }
 
             // Is this canvas actually within the visible screen bounds?
             // Neighbor pages in a TabView sit off to the side; their
             // window-space frame won't intersect the screen.
             let frameInWindow = canvas.convert(canvas.bounds, to: nil)
             let onScreen = window.bounds.intersects(frameInWindow)
-            guard onScreen else { return }
+            guard onScreen else {
+                deactivatePicker()
+                return
+            }
 
-            // Already focused → do nothing. Repeatedly re-claiming focus
-            // is itself a source of churn.
-            guard !canvas.isFirstResponder else { return }
-
-            let picker = SharedToolPicker.picker
-            picker.addObserver(canvas)
+            installPickerAccessoryItemIfNeeded()
+            startObservingToolPicker()
+            if !isCanvasAttachedToPicker {
+                picker.addObserver(canvas)
+                isCanvasAttachedToPicker = true
+            }
             picker.setVisible(true, forFirstResponder: canvas)
-            canvas.becomeFirstResponder()
+
+            let wasAlreadyFocused = canvas.isFirstResponder
+            if !wasAlreadyFocused { canvas.becomeFirstResponder() }
+
+            // Derive the app overlay mode from the picker after activation.
+            // Picker state is autosaved, so this also preserves the user's
+            // last pen/lasso/text/shape choice while changing pages.
+            if needsPickerStateSync || !wasAlreadyFocused {
+                isSynchronizingTool = true
+                applySelectedPickerItem(picker.selectedToolItem)
+                isSynchronizingTool = false
+                needsPickerStateSync = false
+            }
+        }
+
+        func stopObservingToolPicker() {
+            guard isObservingToolPicker else { return }
+            picker.removeObserver(self)
+            isObservingToolPicker = false
+        }
+
+        func deactivatePicker(resignFirstResponder: Bool = true) {
+            guard let canvas else {
+                stopObservingToolPicker()
+                needsPickerStateSync = true
+                return
+            }
+            if isCanvasAttachedToPicker {
+                picker.setVisible(false, forFirstResponder: canvas)
+                picker.removeObserver(canvas)
+                isCanvasAttachedToPicker = false
+            }
+            if resignFirstResponder, canvas.isFirstResponder {
+                canvas.resignFirstResponder()
+            }
+            if picker.accessoryItem === pickerAccessoryItem {
+                picker.accessoryItem = nil
+            }
+            pickerAccessoryItem = nil
+            stopObservingToolPicker()
+            needsPickerStateSync = true
+        }
+
+        private func installPickerAccessoryItemIfNeeded() {
+            guard pickerAccessoryItem == nil else { return }
+            let action = UIAction(
+                title: "Customize Tools",
+                image: UIImage(systemName: "slider.horizontal.3")
+            ) { [weak self] _ in
+                self?.parent.onRequestToolCustomization()
+            }
+            let item = UIBarButtonItem(primaryAction: action)
+            item.accessibilityLabel = "Customize Tools"
+            pickerAccessoryItem = item
+            picker.accessoryItem = item
+        }
+
+        private func startObservingToolPicker() {
+            guard !isObservingToolPicker else { return }
+            picker.addObserver(self)
+            isObservingToolPicker = true
         }
 
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
             parent.canvasViewDrawingDidChange(canvasView)
+        }
+
+        func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+            controller?.canvasInteractionBegan()
         }
     }
 

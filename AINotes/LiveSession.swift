@@ -10,6 +10,87 @@
 import Foundation
 import UIKit
 
+struct DrawingDispatchOutcome {
+    let requestedCount: Int
+    let renderedCount: Int
+    let skippedCount: Int
+    let failureReason: String?
+}
+
+/// Bridges the existing synchronous view callback to the player's real,
+/// asynchronous placement result without forcing view-layer API changes.
+/// Tickets are matched by the encoded action batch and canvas dimensions;
+/// duplicate batches claim the oldest matching ticket deterministically.
+@MainActor
+final class DrawingDispatchOutcomeBroker {
+    static let shared = DrawingDispatchOutcomeBroker()
+
+    private struct Pending {
+        let signature: String
+        let requestedCount: Int
+        let completion: (DrawingDispatchOutcome) -> Void
+        var claimed = false
+        var timeoutTask: Task<Void, Never>?
+    }
+
+    private var pending: [UUID: Pending] = [:]
+    private var order: [UUID] = []
+
+    @discardableResult
+    func register(actions: [DrawingActionDTO], bounds: CGRect,
+                  completion: @escaping (DrawingDispatchOutcome) -> Void) -> UUID {
+        let id = UUID()
+        pending[id] = Pending(signature: signature(actions: actions, bounds: bounds),
+                              requestedCount: actions.count,
+                              completion: completion)
+        order.append(id)
+        pending[id]?.timeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.finish(
+                id,
+                outcome: DrawingDispatchOutcome(
+                    requestedCount: actions.count,
+                    renderedCount: 0,
+                    skippedCount: actions.count,
+                    failureReason: "drawing placement timed out before rendering began"
+                )
+            )
+        }
+        return id
+    }
+
+    func claim(actions: [DrawingActionDTO], bounds: CGRect) -> UUID? {
+        let wanted = signature(actions: actions, bounds: bounds)
+        guard let id = order.first(where: {
+            guard let item = pending[$0] else { return false }
+            return !item.claimed && item.signature == wanted
+        }) else { return nil }
+        pending[id]?.claimed = true
+        return id
+    }
+
+    func finish(_ id: UUID?, outcome: DrawingDispatchOutcome) {
+        guard let id, let item = pending.removeValue(forKey: id) else { return }
+        order.removeAll { $0 == id }
+        item.timeoutTask?.cancel()
+        item.completion(outcome)
+    }
+
+    func discardAll() {
+        for item in pending.values { item.timeoutTask?.cancel() }
+        pending.removeAll()
+        order.removeAll()
+    }
+
+    private func signature(actions: [DrawingActionDTO], bounds: CGRect) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let encoded = (try? encoder.encode(actions))?.base64EncodedString() ?? "?"
+        return "\(Int(bounds.width.rounded()))x\(Int(bounds.height.rounded())):\(encoded)"
+    }
+}
+
 @MainActor
 @Observable
 final class LiveSession {
@@ -97,6 +178,7 @@ final class LiveSession {
         heartbeatTask = nil
         modelTurnActive = false
         lastModelAudioAt = 0
+        DrawingDispatchOutcomeBroker.shared.discardAll()
         onSessionEnded?()
     }
     
@@ -288,37 +370,87 @@ final class LiveSession {
         drawingsExtracted += drawings.count
         let bounds = canvasBoundsProvider?() ?? .zero
 
-        // Build a response the model can actually act on. The key contract:
-        // it must never be able to mistake "nothing rendered" for success.
-        var result: [String: Any]
+        // Invalid batches can be answered immediately. Valid content waits
+        // for AIDrawingPlayer's actual placement/expansion result so an
+        // unsafe omitted action is never reported as rendered.
         if rawActions == nil {
-            result = ["status": "error",
-                      "error": "missing or malformed 'drawings' argument — NOTHING was drawn"]
+            sendDrawResult(call: call, result: [
+                "status": "error",
+                "error": "missing or malformed 'drawings' argument — NOTHING was drawn"
+            ], bounds: bounds)
+            return
         } else if bounds.width == 0 || bounds.height == 0 {
-            result = ["status": "error",
-                      "error": "canvas not ready — NOTHING was drawn, retry in a moment"]
+            sendDrawResult(call: call, result: [
+                "status": "error",
+                "error": "canvas not ready — NOTHING was drawn, retry in a moment"
+            ], bounds: bounds)
+            return
         } else if drawings.isEmpty {
-            result = ["status": "error",
-                      "error": "no valid actions — NOTHING was drawn. Fix these and call draw again: "
-                               + problems.joined(separator: "; ")]
-        } else {
-            drawingsDispatched += drawings.count
-            onDrawAction?(drawings, bounds)
-            if problems.isEmpty {
-                result = ["status": "ok",
-                          "drewActions": drawings.count,
-                          "note": "ink is rendering on the canvas now; the next video frame shows it"]
-            } else {
-                result = ["status": "partial",
-                          "drewActions": drawings.count,
-                          "skippedActions": problems.count,
-                          "error": "these actions were invalid and NOT drawn: "
-                                   + problems.joined(separator: "; ")]
-            }
+            sendDrawResult(call: call, result: [
+                "status": "error",
+                "error": "no valid actions — NOTHING was drawn. Fix these and call draw again: "
+                    + problems.joined(separator: "; ")
+            ], bounds: bounds)
+            return
         }
 
-        print("📐 draw tool: \(result)  bounds=\(bounds)")
+        guard let dispatch = onDrawAction else {
+            sendDrawResult(call: call, result: [
+                "status": "error",
+                "error": "drawing surface is unavailable — NOTHING was drawn"
+            ], bounds: bounds)
+            return
+        }
 
+        DrawingDispatchOutcomeBroker.shared.register(actions: drawings,
+                                                      bounds: bounds) { [weak self] outcome in
+            self?.finishDrawToolCall(call: call, validationProblems: problems,
+                                     outcome: outcome, bounds: bounds)
+        }
+        dispatch(drawings, bounds)
+    }
+
+    private func finishDrawToolCall(call: ToolCall,
+                                    validationProblems: [String],
+                                    outcome: DrawingDispatchOutcome,
+                                    bounds: CGRect) {
+        drawingsDispatched += outcome.renderedCount
+        let skipped = validationProblems.count + outcome.skippedCount
+        var details = validationProblems
+        if outcome.skippedCount > 0 {
+            details.append("\(outcome.skippedCount) valid action(s) were NOT drawn because placement was unsafe or produced no renderable output")
+        }
+        if let reason = outcome.failureReason { details.append(reason) }
+
+        let result: [String: Any]
+        if outcome.renderedCount == 0 {
+            result = [
+                "status": "error",
+                "drewActions": 0,
+                "skippedActions": skipped,
+                "error": "NOTHING was drawn. " + details.joined(separator: "; ")
+            ]
+        } else if skipped > 0 {
+            result = [
+                "status": "partial",
+                "drewActions": outcome.renderedCount,
+                "skippedActions": skipped,
+                "error": details.joined(separator: "; "),
+                "note": "only the reported drewActions are rendering on the canvas"
+            ]
+        } else {
+            result = [
+                "status": "ok",
+                "drewActions": outcome.renderedCount,
+                "note": "all actions passed placement and are rendering on the canvas now"
+            ]
+        }
+        sendDrawResult(call: call, result: result, bounds: bounds)
+    }
+
+    private func sendDrawResult(call: ToolCall, result: [String: Any],
+                                bounds: CGRect) {
+        print("📐 draw tool: \(result)  bounds=\(bounds)")
         client.sendToolResponse(callID: call.id, name: call.name, result: result)
     }
 
@@ -336,6 +468,26 @@ final class LiveSession {
         case .text:
             if d.x == nil || d.y == nil || d.text == nil {
                 return "text needs x, y, and text"
+            }
+        case .equation:
+            guard d.x != nil, d.y != nil,
+                  let formula = d.latex ?? d.text,
+                  !formula.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return "equation needs x, y, and non-empty latex"
+            }
+        case .plot:
+            guard let spec = d.plot else {
+                return "plot needs a plot object with at least kind"
+            }
+            do {
+                let preview = try MathPlotRenderer.render(
+                    spec: spec,
+                    in: CGRect(x: 0, y: 0, width: 640, height: 420)
+                )
+                if preview.isEmpty { return "plot produced no renderable geometry" }
+            } catch {
+                return (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
             }
         case .node:
             if d.x == nil || d.y == nil {
@@ -448,10 +600,10 @@ final class LiveSession {
         partial. If a frame arrives and your drawing isn't in it, your
         call failed — draw again instead of insisting you already did.
 
-        When EXTENDING a previous tree (e.g. "add 100 to the BST"):
-        re-state EVERY previous node plus the new one in the new `tree`
-        action's `nodes` array. Don't omit any. The app replaces the old
-        tree wholesale with the new one.
+        A `tree` action is additive and NEVER erases earlier AI work. When
+        EXTENDING a previous tree (e.g. "add 100 to the BST"), add only the
+        new bubble with `node`, then connect it with `edge` using the earlier
+        parent's `id:LABEL` anchor. Do not re-send the whole tree on top.
         
         The `draw` tool is part of you, available RIGHT NOW. You do not
         need permission. You do not apologize for "not being able to."
@@ -474,7 +626,34 @@ final class LiveSession {
         
         Primitives:
           - path: {type:"path", points:[[x,y],...], color}
-          - text: {type:"text", x, y, text, color}  -- (x,y) = center
+                  freehand annotations only; do not use for data plots
+          - text: {type:"text", x, y, text, color}  -- (x,y) requests the
+                  block center; prose is wrapped and leading-aligned. Prefer
+                  a left/right lane (x near 0.22 or 0.78), not x=0.5.
+          - equation: {type:"equation", x, y, latex, color}
+                  TeX math with real grouped scripts/fractions/roots. ALWAYS
+                  use this for formulas instead of Unicode superscript or
+                  subscript characters. Example:
+                  {type:"equation", x:0.28, y:0.3,
+                   latex:"\\int_0^{2\\pi}\\int_0^2 r\\,dr\\,d\\theta",
+                   color:"blue"}
+          - plot: {type:"plot", x, y, width, height, color, plot:{...}}
+                  x/y is the plot box's top-left. The app draws axes, ticks,
+                  curves, data marks, and inequality hatching exactly.
+                  plot.kind supports function, parametric, implicit, line,
+                  scatter, bar, histogram, and disk. Expressions support
+                  + - * / ^, pi/e, sin/cos/tan, exp/log/sqrt/abs/min/max.
+                  Use plot.domain:{xMin,xMax,yMin,yMax,tMin?,tMax?} when the
+                  mathematical range matters. Set equalScale:true when equal
+                  x/y units must look geometrically equal (automatic for
+                  implicit and disk plots). For line/scatter/bar provide
+                  plot.points:[[dataX,dataY],...]; histogram uses values:[...].
+                  Exact disk example for x^2+y^2<=4:
+                  {type:"plot", x:0.12, y:0.22, width:0.70, height:0.62,
+                   color:"blue", plot:{kind:"disk", centerX:0, centerY:0,
+                   radius:2, relation:"lte", fill:true,
+                   domain:{xMin:-3,xMax:3,yMin:-3,yMax:3},
+                   title:"x^2 + y^2 <= 4", xAxisLabel:"x", yAxisLabel:"y"}}
           - node: {type:"node", x, y, width, text, color}
                   labeled circle, (x,y) = center, width = diameter
           - edge: {type:"edge", from, to, arrowhead, color}
@@ -493,11 +672,14 @@ final class LiveSession {
         1. Look at the LATEST frame and find genuinely EMPTY regions.
         2. Put new content in the largest empty region NEXT TO the work it
            refers to — an empty right or left column beats the center. Do
-           NOT default to the middle of the page and grow downward.
-        3. NEVER cover: the student's handwriting, your own earlier ink,
-           or the top-right corner (x > 0.72, y < 0.12 — app buttons).
-        4. Pack text tightly: consecutive lines share the same x and step
-           y by just 0.05. Keep explanations to a few short lines.
+           NOT default to x=0.5 or grow down one narrow center column. Fill
+           left and right lanes before consuming another vertical row.
+        3. NEVER cover the student's handwriting, imported document content,
+           or your own earlier ink/text. The entire page, including its top
+           row, is usable when it is visually empty.
+        4. Pack text tightly. One text action may contain a short sentence;
+           the app wraps it into a leading-aligned column. Keep explanations
+           to a few short lines and do not emit one centered action per line.
         5. Keep everything inside 0.03...0.97 on both axes.
         6. Out of room? Ask the student to tap "Clear AI" or add a page —
            never pile ink on ink.
@@ -517,17 +699,19 @@ final class LiveSession {
         NEVER use black, white, gray, or yellow: the student's canvas can
         be white OR near-black depending on their device theme, and those
         colors blend in — your ink would be invisible to them.
+
+        For math, computer science, and data science questions, prefer the
+        strongest structured primitive available: equation for notation,
+        plot for functions/relations/data, and tree/node/edge for discrete
+        structures. Never approximate a plot with a hand-guessed path when
+        plot can encode it in mathematical coordinates.
         
         # Modifying existing drawings
 
-        When the student asks you to ADD to, EXTEND, FIX, or MODIFY an
-        existing tree: re-send a complete `tree` action with the FULL set
-        of nodes (old + new). The app clears the previous tree and animates
-        the updated one. Do NOT try to send only the delta as a `tree`.
-
-        For non-tree changes (a label, an arrow, a single new path), send
-        just the new primitives — those are additive. Reference earlier
-        nodes in `edge.from`/`edge.to` via "id:LABEL".
+        All primitives are additive. To extend an existing tree, send the
+        new node and edge only; reference earlier nodes via `id:LABEL`. If a
+        wholesale replacement is truly required, ask the student to use
+        Clear AI first, then draw the complete corrected tree in a new call.
         
         # Tone
         

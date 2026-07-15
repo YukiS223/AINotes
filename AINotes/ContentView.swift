@@ -1,6 +1,8 @@
 import SwiftUI
 import SwiftData
 import PencilKit
+import PhotosUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(\.modelContext) private var context
@@ -78,6 +80,10 @@ struct NotebookView: View {
     @Environment(\.modelContext) private var context
 
     @State private var currentIndex: Int = 0
+    @State private var showFileImporter = false
+    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var isImporting = false
+    @State private var importFailure: ImportFailure?
 
     private var sortedPages: [Page] {
         notebook.pages.sorted { $0.index < $1.index }
@@ -90,7 +96,7 @@ struct NotebookView: View {
             } else {
                 TabView(selection: $currentIndex) {
                     ForEach(Array(sortedPages.enumerated()), id: \.element.id) { idx, page in
-                        PageEditor(page: page)
+                        PageEditor(page: page, isActive: currentIndex == idx)
                             .tag(idx)
                     }
                 }
@@ -101,11 +107,59 @@ struct NotebookView: View {
         .navigationTitle(notebook.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Menu {
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        Label("PDF or Image from Files", systemImage: "folder")
+                    }
+
+                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                        Label("Image from Photos", systemImage: "photo.on.rectangle")
+                    }
+                } label: {
+                    Label("Import", systemImage: "square.and.arrow.down")
+                }
+                .disabled(isImporting)
+
                 Button(action: addPage) {
                     Label("Add Page", systemImage: "plus.square")
                 }
+                .disabled(isImporting)
             }
+        }
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.pdf, .image],
+            allowsMultipleSelection: true,
+            onCompletion: handleFileImport
+        )
+        .onChange(of: selectedPhoto) { _, item in
+            guard let item else { return }
+            guard !isImporting else {
+                selectedPhoto = nil
+                return
+            }
+            isImporting = true
+            Task { await importPhoto(item) }
+        }
+        .overlay {
+            if isImporting {
+                ZStack {
+                    Color.black.opacity(0.12).ignoresSafeArea()
+                    ProgressView("Importing pages…")
+                        .padding(18)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
+            }
+        }
+        .alert(item: $importFailure) { failure in
+            Alert(
+                title: Text("Couldn’t Import"),
+                message: Text(failure.message),
+                dismissButton: .default(Text("OK"))
+            )
         }
     }
 
@@ -116,14 +170,158 @@ struct NotebookView: View {
         notebook.pages.append(page)
         currentIndex = sortedPages.count - 1
     }
+
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard !urls.isEmpty, !isImporting else { return }
+            isImporting = true
+            Task {
+                await Task.yield()
+                defer { isImporting = false }
+
+                var firstImportedPage: Page?
+                var failures: [String] = []
+                for url in urls {
+                    do {
+                        try await PageBackgroundImporter.importFile(at: url) { background in
+                            let page = try appendImportedPage(background)
+                            if firstImportedPage == nil { firstImportedPage = page }
+                        }
+                    } catch {
+                        failures.append(error.localizedDescription)
+                    }
+                }
+
+                selectImportedPage(firstImportedPage)
+                if !failures.isEmpty {
+                    importFailure = ImportFailure(message: failures.joined(separator: "\n"))
+                }
+            }
+        case .failure(let error):
+            // Cancelling the system picker is not an import failure worth
+            // interrupting the user with.
+            if (error as NSError).code != NSUserCancelledError {
+                importFailure = ImportFailure(message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func importPhoto(_ item: PhotosPickerItem) async {
+        defer {
+            isImporting = false
+            selectedPhoto = nil
+        }
+
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                throw PageBackgroundImportError.unreadableFile("Selected photo")
+            }
+            let contentType = item.supportedContentTypes.first?.identifier
+                ?? UTType.image.identifier
+            let imported = try await Task.detached(priority: .userInitiated) {
+                try PageBackgroundImporter.loadImage(
+                    data: data,
+                    sourceName: "Photo",
+                    sourceContentType: contentType
+                )
+            }.value
+            selectImportedPage(try appendImportedPage(imported))
+        } catch {
+            importFailure = ImportFailure(message: error.localizedDescription)
+        }
+    }
+
+    private func appendImportedPage(_ background: ImportedPageBackground) throws -> Page {
+        // A brand-new notebook starts with one blank page. Reuse it for the
+        // first import instead of leaving an unexplained empty sheet in
+        // front of the document.
+        if notebook.pages.count == 1,
+           let blank = notebook.pages.first,
+           isBlank(blank) {
+            apply(background, to: blank)
+            do {
+                try context.save()
+                return blank
+            } catch {
+                clearBackground(on: blank)
+                throw error
+            }
+        }
+
+        let nextIndex = (notebook.pages.map(\.index).max() ?? -1) + 1
+        let page = Page(index: nextIndex)
+        apply(background, to: page)
+        page.notebook = notebook
+        notebook.pages.append(page)
+        context.insert(page)
+        do {
+            try context.save()
+            return page
+        } catch {
+            notebook.pages.removeAll { $0 === page }
+            context.delete(page)
+            throw error
+        }
+    }
+
+    private func selectImportedPage(_ page: Page?) {
+        if let page,
+           let position = sortedPages.firstIndex(where: { $0 === page }) {
+            currentIndex = position
+        }
+    }
+
+    private func apply(_ background: ImportedPageBackground, to page: Page) {
+        page.backgroundData = background.data
+        page.backgroundSourceName = background.sourceName
+        page.backgroundContentType = background.contentType
+        page.backgroundPageNumber = background.pageNumber
+    }
+
+    private func clearBackground(on page: Page) {
+        page.backgroundData = nil
+        page.backgroundSourceName = nil
+        page.backgroundContentType = nil
+        page.backgroundPageNumber = nil
+    }
+
+    private func isBlank(_ page: Page) -> Bool {
+        page.drawingData.isEmpty
+            && page.chatData.isEmpty
+            && page.aiDrawingData.isEmpty
+            && page.annotationData.isEmpty
+            && (page.textLayerData?.isEmpty ?? true)
+            && page.backgroundData == nil
+    }
+}
+
+private struct ImportFailure: Identifiable {
+    let id = UUID()
+    let message: String
 }
 
 // MARK: - Single page editor
 
 struct PageEditor: View {
     @Bindable var page: Page
+    let isActive: Bool
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var drawing = PKDrawing()
     @State private var showTutor = false
+    @State private var toolMode: CanvasToolMode = .ink
+    @State private var canvasController = CanvasController()
+    @State private var textStore = PageTextStore()
+    @State private var backgroundImage: UIImage?
+    @State private var backgroundAvoidRects: [CGRect] = []
+    @State private var referenceCanvasSize: CGSize?
+    @State private var showTextEditor = false
+    @State private var draftText = ""
+    @State private var editingTextID: UUID?
+    @State private var pendingTextPoint: CGPoint?
+    @State private var hasLoadedPersisted = false
+    @State private var showToolCustomization = false
+    @State private var toolConfiguration = EditorToolConfiguration.shared
 
     // Mark-over-ink layer (existing).
     @State private var aiAnnotations: [AnnotationDTO] = []
@@ -132,17 +330,19 @@ struct PageEditor: View {
     // Generative draw layer (new).
     @State private var aiPlayer = AIDrawingPlayer()
 
-    @State private var showGrid = false
     @State private var canvasSize: CGSize = .zero
     @State private var liveSession = LiveSession()
 
-    /// The coordinate space the model addresses with fractional coords.
-    /// = the visible viewport. Drawings at x=0.5 land in the middle of
-    /// what the user sees on screen, regardless of where their ink is.
+    private var stablePageSize: CGSize {
+        if let referenceCanvasSize { return referenceCanvasSize }
+        if canvasSize.width > 0, canvasSize.height > 0 { return canvasSize }
+        return CGSize(width: 820, height: 1100)
+    }
+    /// PencilKit and every overlay share this persistent logical coordinate
+    /// space. The whole page is scaled for display when the window changes;
+    /// its stroke coordinates never move underneath the imported paper.
     private var canvasBounds: CGRect {
-        canvasSize == .zero
-            ? CGRect(x: 0, y: 0, width: 820, height: 1100)
-            : CGRect(origin: .zero, size: canvasSize)
+        CGRect(origin: .zero, size: stablePageSize)
     }
     private var isLiveSession: Bool {
         if case .live = liveSession.state { return true }
@@ -156,33 +356,90 @@ struct PageEditor: View {
     }
 
     var body: some View {
-        ZStack {
-            CanvasView(drawing: $drawing)
-            // AI ink layer — non-interactive, sits above user canvas.
-            AIDrawingCanvas(drawing: aiPlayer.displayedDrawing)
-                .allowsHitTesting(false)
-            // AI text labels.
-            AILabelsOverlay(labels: aiPlayer.labels)
-            // Marks-over-ink (snapped circles, arrows, etc.).
-            AnnotationOverlay(
-                annotations: aiAnnotations,
-                snapshotBounds: aiBounds,
-                inkBounds: drawing.strokes.map(\.renderBounds)
-            )
-            if showGrid {
-                CoordinateGrid(bounds: canvasBounds)
+        GeometryReader { geo in
+            let viewportSize = geo.size
+            let pageSize = referenceCanvasSize ?? validPageSize(viewportSize)
+            let scale = pageDisplayScale(pageSize: pageSize, viewportSize: viewportSize)
+            let displayedSize = CGSize(width: pageSize.width * scale,
+                                       height: pageSize.height * scale)
+
+            ZStack(alignment: .topLeading) {
+                Color(uiColor: .systemGroupedBackground)
+                pageSurface(size: pageSize)
+                    .frame(width: pageSize.width, height: pageSize.height)
+                    .scaleEffect(scale, anchor: .topLeading)
+                    .offset(
+                        x: max(0, (viewportSize.width - displayedSize.width) / 2),
+                        y: max(0, (viewportSize.height - displayedSize.height) / 2)
+                    )
+                    .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+            }
+            .clipped()
+            .onAppear { updateCanvasSize(viewportSize) }
+            .onChange(of: viewportSize) { _, new in updateCanvasSize(new) }
+        }
+        .ignoresSafeArea(edges: .bottom)
+        .toolbar {
+            if isActive {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if hasSeparatedEditorTools {
+                        Menu {
+                            if toolConfiguration.isEnabled(EditorPickerItemID.text) {
+                                Button {
+                                    toolMode = .text
+                                } label: {
+                                    Label("Text", systemImage: "character.cursor.ibeam")
+                                }
+                            }
+
+                            let enabledShapes = ShapeKind.allCases.filter {
+                                toolConfiguration.isEnabled(EditorPickerItemID.shape($0))
+                            }
+                            if !enabledShapes.isEmpty {
+                                Section("Shapes") {
+                                    ForEach(enabledShapes) { kind in
+                                        Button {
+                                            toolMode = .shape(kind)
+                                        } label: {
+                                            Label(kind.title, systemImage: kind.symbolName)
+                                        }
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label("Text and Shapes", systemImage: separatedToolSymbol)
+                        }
+                    }
+                    // PKToolPicker only promises its accessory item in
+                    // expanded layouts. Keep customization reachable in
+                    // iPhone and narrow Split View without duplicating it on
+                    // the full-width iPad picker.
+                    if horizontalSizeClass == .compact {
+                        Button("Customize Tools", systemImage: "slider.horizontal.3") {
+                            showToolCustomization = true
+                        }
+                    }
+                    if hasAIContent {
+                        Button("Clear AI", systemImage: "eraser") {
+                            clearAllAIContent()
+                        }
+                    }
+                    Button(isLiveSession ? "Live" : "Tutor",
+                           systemImage: isLiveSession
+                               ? "waveform.circle.fill"
+                               : "sparkles") {
+                        showTutor = true
+                    }
+                    .tint(isLiveSession ? .red : nil)
+                }
             }
         }
-        .background(
-            GeometryReader { geo in
-                Color.clear
-                    .onAppear { canvasSize = geo.size }
-                    .onChange(of: geo.size) { _, new in canvasSize = new }
-            }
-        )
-        .ignoresSafeArea(edges: .bottom)
         .onAppear {
+            canvasController.attachTextEditor(textStore)
             loadPersisted()
+            hasLoadedPersisted = true
+            initializeReferenceCanvasIfNeeded(minimumSize: canvasSize)
+            refreshBackgroundAvoidRects()
             // End Session must kill EVERYTHING in flight — including a
             // drawing animation that would otherwise keep painting after
             // the connection is gone. Bind the player directly (not via
@@ -198,48 +455,40 @@ struct PageEditor: View {
         // snapshot provider is bound to THIS page, so leaving it running
         // would stream a stale page to the model — and previously also
         // leaked the socket and mic (nothing ever stopped them).
-        .onDisappear { liveSession.stop() }
+        .onDisappear {
+            textStore.deselectText()
+            liveSession.stop()
+        }
         .onChange(of: drawing) { _, newValue in
             page.drawingData = newValue.dataRepresentation()
             liveSession.noteCanvasChanged()      // NEW
         }
-        
-        .overlay(alignment: .topTrailing) {
-            HStack(spacing: 8) {
-                Button {
-                    showGrid.toggle()
-                } label: {
-                    Label("Grid", systemImage: showGrid ? "grid.circle.fill" : "grid.circle")
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.regularMaterial, in: Capsule())
-                }
-                if hasAIContent {
-                    Button {
-                        clearAllAIContent()
-                    } label: {
-                        Label("Clear AI", systemImage: "eraser")
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(.regularMaterial, in: Capsule())
-                    }
-                }
-                Button {
-                    showTutor = true
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: isLiveSession ? "waveform.circle.fill" : "sparkles")
-                            .symbolEffect(.pulse, options: .repeating, isActive: isLiveSession)
-                        Text(isLiveSession ? "Live" : "Tutor")
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(isLiveSession ? Color.red : Color.accentColor, in: Capsule())
-                    .foregroundStyle(.white)
-                }
-            }
-            .padding()
+        .onChange(of: page.backgroundData) { _, newValue in
+            backgroundImage = newValue.flatMap(UIImage.init(data:))
+            refreshBackgroundAvoidRects()
+            liveSession.noteCanvasChanged()
         }
+        .onChange(of: textStore.boxes) { _, _ in
+            page.textLayerData = textStore.encodedData()
+            liveSession.noteCanvasChanged()
+        }
+        .onChange(of: toolMode) { _, newMode in
+            if newMode != .selection && newMode != .text {
+                textStore.deselectText()
+            }
+        }
+        .onChange(of: toolConfiguration.enabledIDs) { _, enabledIDs in
+            switch toolMode {
+            case .text where !enabledIDs.contains(EditorPickerItemID.text):
+                toolMode = .ink
+            case .shape(let kind)
+                where !enabledIDs.contains(EditorPickerItemID.shape(kind)):
+                toolMode = .ink
+            case .ink, .selection, .text, .shape:
+                break
+            }
+        }
+
         .sheet(isPresented: $showTutor) {
             TutorPanel(
                 captureSnapshot: snapshot,
@@ -249,12 +498,11 @@ struct PageEditor: View {
                     // Student ink: snap targets for "circle the answer"
                     // loops and keep-out zones for explanation text.
                     let ink = drawing.strokes.map(\.renderBounds)
-                    // Keep-out for the Grid / Clear AI / Tutor buttons.
-                    let controls = CGRect(x: max(bounds.minX, bounds.maxX - 420),
-                                          y: bounds.minY, width: 420, height: 64)
+                        + textStore.boxes.map { $0.frame.cgRect.insetBy(dx: -8, dy: -8) }
                     Task {
                         await aiPlayer.play(actions: drawings, canvasBounds: bounds,
-                                            userInk: ink, avoidRects: [controls])
+                                            userInk: ink,
+                                            avoidRects: backgroundAvoidRects)
                         saveAIDrawing()
                         // Ship a frame NOW so the model sees its own ink
                         // land instead of waiting for the next heartbeat.
@@ -267,15 +515,91 @@ struct PageEditor: View {
             .presentationDragIndicator(.visible)              // NEW
 
         }
+        .sheet(isPresented: $showToolCustomization) {
+            EditorToolCustomizationView(configuration: toolConfiguration)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .alert(editingTextID == nil ? "Add Text" : "Edit Text",
+               isPresented: $showTextEditor) {
+            TextField("Text", text: $draftText)
+            Button("Cancel", role: .cancel) { resetTextEditor() }
+            Button(editingTextID == nil ? "Add" : "Save") { commitTextEditor() }
+                .disabled(draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: {
+            Text("Text remains editable and can be moved or copied with Selection.")
+        }
+    }
+
+    @ViewBuilder
+    private func pageSurface(size: CGSize) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.white
+            if let backgroundImage {
+                Image(uiImage: backgroundImage)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: size.width, height: size.height)
+                    .allowsHitTesting(false)
+            }
+            CanvasView(
+                drawing: $drawing,
+                toolMode: $toolMode,
+                controller: canvasController,
+                enabledToolIDs: toolConfiguration.enabledIDs.intersection(
+                    EditorPickerItemID.nativePickerIDs
+                ),
+                isActive: isActive,
+                onRequestToolCustomization: {
+                    showToolCustomization = true
+                }
+            )
+            if toolMode == .text {
+                TextPlacementOverlay(onTap: beginAddingText(at:))
+            }
+            NoteTextBoxesOverlay(
+                store: textStore,
+                mode: toolMode,
+                onEdit: beginEditingText(id:)
+            )
+            if let shapeKind = toolMode.shapeKind {
+                ShapeDrawingOverlay(
+                    kind: shapeKind,
+                    style: canvasController.currentShapeStyle(),
+                    onCommit: canvasController.append(strokes:)
+                )
+            }
+            AIDrawingCanvas(drawing: aiPlayer.displayedDrawing)
+                .allowsHitTesting(false)
+            AILabelsOverlay(labels: aiPlayer.labels)
+            AnnotationOverlay(
+                annotations: aiAnnotations,
+                snapshotBounds: aiBounds,
+                inkBounds: drawing.strokes.map(\.renderBounds)
+            )
+        }
+        .contentShape(Rectangle())
     }
 
     // MARK: - Persistence
 
     private func loadPersisted() {
+        if let width = page.referenceCanvasWidth,
+           let height = page.referenceCanvasHeight,
+           width > 0, height > 0 {
+            referenceCanvasSize = CGSize(width: width, height: height)
+            textStore.setPageBounds(CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        if let data = page.backgroundData {
+            backgroundImage = UIImage(data: data)
+        } else {
+            backgroundImage = nil
+        }
         if !page.drawingData.isEmpty,
            let loaded = try? PKDrawing(data: page.drawingData) {
             drawing = loaded
         }
+        textStore.load(from: page.textLayerData)
         if let stored = try? JSONDecoder()
             .decode(StoredAnnotations.self, from: page.annotationData) {
             aiAnnotations = stored.annotations
@@ -285,8 +609,144 @@ struct PageEditor: View {
            let stored = try? JSONDecoder()
             .decode(StoredAIDrawing.self, from: page.aiDrawingData),
            let pk = try? PKDrawing(data: stored.pkDrawingBytes) {
-            aiPlayer.loadCommitted(drawing: pk, labels: stored.labels)
+            aiPlayer.loadCommitted(
+                drawing: pk,
+                labels: stored.labels,
+                reservedRects: (stored.reservedRects ?? []).map(\.cgRect)
+            )
         }
+    }
+
+    private func updateCanvasSize(_ newSize: CGSize) {
+        guard newSize.width > 0, newSize.height > 0 else { return }
+        canvasSize = newSize
+        if referenceCanvasSize != nil {
+            textStore.setPageBounds(canvasBounds)
+            return
+        }
+        guard hasLoadedPersisted else { return }
+        initializeReferenceCanvasIfNeeded(minimumSize: newSize)
+    }
+
+    private func initializeReferenceCanvasIfNeeded(minimumSize: CGSize) {
+        guard referenceCanvasSize == nil,
+              minimumSize.width > 0, minimumSize.height > 0 else { return }
+        if let width = page.referenceCanvasWidth,
+           let height = page.referenceCanvasHeight,
+           width > 0, height > 0 {
+            referenceCanvasSize = CGSize(width: width, height: height)
+            textStore.setPageBounds(CGRect(x: 0, y: 0, width: width, height: height))
+        } else {
+            let referenceSize = legacyContentSize(minimumSize: minimumSize)
+            referenceCanvasSize = referenceSize
+            page.referenceCanvasWidth = referenceSize.width
+            page.referenceCanvasHeight = referenceSize.height
+            textStore.setPageBounds(CGRect(origin: .zero, size: referenceSize))
+        }
+        refreshBackgroundAvoidRects()
+    }
+
+    private func refreshBackgroundAvoidRects() {
+        guard let backgroundImage else {
+            backgroundAvoidRects = []
+            return
+        }
+        backgroundAvoidRects = BackgroundOccupancy.rects(
+            for: backgroundImage,
+            canvasBounds: canvasBounds
+        )
+    }
+
+    private func legacyContentSize(minimumSize: CGSize) -> CGSize {
+        var contentMaxX: CGFloat = 0
+        var contentMaxY: CGFloat = 0
+
+        func include(_ rect: CGRect) {
+            guard !rect.isNull, !rect.isInfinite,
+                  rect.maxX.isFinite, rect.maxY.isFinite else { return }
+            contentMaxX = max(contentMaxX, rect.maxX)
+            contentMaxY = max(contentMaxY, rect.maxY)
+        }
+
+        include(drawing.bounds)
+        include(aiPlayer.committedDrawing.bounds)
+        include(aiBounds)
+        for label in aiPlayer.labels { include(AILabelLayout.rect(for: label)) }
+        for reserved in aiPlayer.reservedRects { include(reserved) }
+        for box in textStore.boxes { include(box.frame.cgRect) }
+
+        let margin: CGFloat = 32
+        let width = contentMaxX > minimumSize.width
+            ? ceil(contentMaxX + margin)
+            : minimumSize.width
+        let height = contentMaxY > minimumSize.height
+            ? ceil(contentMaxY + margin)
+            : minimumSize.height
+        return CGSize(width: width, height: height)
+    }
+
+    private func beginAddingText(at point: CGPoint) {
+        editingTextID = nil
+        pendingTextPoint = point
+        draftText = ""
+        showTextEditor = true
+    }
+
+    private func beginEditingText(id: UUID) {
+        guard let box = textStore.textBox(id: id) else { return }
+        editingTextID = id
+        pendingTextPoint = nil
+        draftText = box.text
+        showTextEditor = true
+    }
+
+    private func commitTextEditor() {
+        if let editingTextID {
+            textStore.updateText(id: editingTextID, text: draftText)
+        } else if let pendingTextPoint {
+            textStore.addText(draftText, centeredAt: pendingTextPoint)
+        }
+        resetTextEditor()
+    }
+
+    private func resetTextEditor() {
+        showTextEditor = false
+        draftText = ""
+        editingTextID = nil
+        pendingTextPoint = nil
+    }
+
+    private func validPageSize(_ size: CGSize) -> CGSize {
+        guard size.width > 0, size.height > 0 else {
+            return CGSize(width: 820, height: 1100)
+        }
+        return size
+    }
+
+    private var hasSeparatedEditorTools: Bool {
+        toolConfiguration.isEnabled(EditorPickerItemID.text)
+            || ShapeKind.allCases.contains {
+                toolConfiguration.isEnabled(EditorPickerItemID.shape($0))
+            }
+    }
+
+    private var separatedToolSymbol: String {
+        switch toolMode {
+        case .text:
+            return "character.cursor.ibeam"
+        case .shape(let kind):
+            return kind.symbolName
+        case .ink, .selection:
+            return "square.on.circle"
+        }
+    }
+
+    private func pageDisplayScale(pageSize: CGSize,
+                                  viewportSize: CGSize) -> CGFloat {
+        guard pageSize.width > 0, pageSize.height > 0,
+              viewportSize.width > 0, viewportSize.height > 0 else { return 1 }
+        return min(viewportSize.width / pageSize.width,
+                   viewportSize.height / pageSize.height)
     }
 
     private func saveAnnotations() {
@@ -297,7 +757,8 @@ struct PageEditor: View {
     private func saveAIDrawing() {
         let stored = StoredAIDrawing(
             pkDrawingBytes: aiPlayer.committedDrawing.dataRepresentation(),
-            labels: aiPlayer.labels
+            labels: aiPlayer.labels,
+            reservedRects: aiPlayer.reservedRects.map(StoredCanvasRect.init)
         )
         page.aiDrawingData = (try? JSONEncoder().encode(stored)) ?? Data()
     }
@@ -340,9 +801,32 @@ struct PageEditor: View {
                 UIColor.white.setFill()
                 ctx.fill(CGRect(origin: .zero, size: size))
 
+                // Imported PDF page or image, laid out exactly like the
+                // SwiftUI aspect-fit background beneath the live canvas.
+                // Its container is the page's original coordinate space,
+                // not today's viewport, so ink stays attached after resize.
+                if let backgroundImage {
+                    let canvasRect = aspectFitRect(
+                        contentSize: backgroundImage.size,
+                        container: CGRect(origin: .zero, size: stablePageSize)
+                    )
+                    backgroundImage.draw(
+                        in: CGRect(
+                            x: canvasRect.minX * scale,
+                            y: canvasRect.minY * scale,
+                            width: canvasRect.width * scale,
+                            height: canvasRect.height * scale
+                        )
+                    )
+                }
+
                 // User's strokes.
                 drawing.image(from: bounds, scale: scale)
                     .draw(in: CGRect(origin: .zero, size: size))
+
+                // Typed text is a first-class user layer and must be visible
+                // to the tutor just like handwriting.
+                drawUserText(in: size, scale: scale)
 
                 // AI's strokes (so the model can see what it already drew).
                 aiPlayer.committedDrawing.image(from: bounds, scale: scale)
@@ -350,23 +834,93 @@ struct PageEditor: View {
 
                 // AI text labels.
                 for label in aiPlayer.labels {
-                    let attrs: [NSAttributedString.Key: Any] = [
-                        .font: UIFont.systemFont(ofSize: 16 * scale, weight: .semibold),
-                        .foregroundColor: AIPalette.uiColor(label.color)
-                    ]
-                    let str = NSAttributedString(string: label.text, attributes: attrs)
-                    let strSize = str.size()
-                    let pos = CGPoint(
-                        x: (label.canvasX - bounds.minX) * scale - strSize.width / 2,
-                        y: (label.canvasY - bounds.minY) * scale - strSize.height / 2
+                    if label.format == "latex" {
+                        let formula = MathLabelRenderer.image(
+                            latex: label.text,
+                            color: AIPalette.uiColor(label.color),
+                            fontSize: CGFloat(label.fontSize ?? 22),
+                            scale: 2
+                        )
+                        let formulaSize = CGSize(width: formula.size.width * scale,
+                                                 height: formula.size.height * scale)
+                        formula.draw(in: CGRect(
+                            x: (label.canvasX - bounds.minX) * scale
+                                - formulaSize.width / 2,
+                            y: (label.canvasY - bounds.minY) * scale
+                                - formulaSize.height / 2,
+                            width: formulaSize.width,
+                            height: formulaSize.height
+                        ))
+                        continue
+                    }
+                    let plain = AILabelLayout.plainImage(
+                        text: label.text,
+                        color: AIPalette.uiColor(label.color),
+                        fontSize: CGFloat(label.fontSize ?? 16),
+                        leading: label.alignment == "leading",
+                        scale: 2
                     )
-                    str.draw(at: pos)
+                    let plainSize = CGSize(width: plain.size.width * scale,
+                                           height: plain.size.height * scale)
+                    plain.draw(in: CGRect(
+                        x: (label.canvasX - bounds.minX) * scale
+                            - plainSize.width / 2,
+                        y: (label.canvasY - bounds.minY) * scale
+                            - plainSize.height / 2,
+                        width: plainSize.width,
+                        height: plainSize.height
+                    ))
                 }
 
+                // The tutor prompt uses this hidden coordinate grid for
+                // precise placement even when the student-facing overlay is
+                // off, so every transmitted frame must retain it.
                 drawGrid(in: ctx.cgContext, size: size)
             }
         }
         return image
+    }
+
+    private func aspectFitRect(contentSize: CGSize,
+                               container: CGRect) -> CGRect {
+        guard contentSize.width > 0, contentSize.height > 0,
+              container.width > 0, container.height > 0 else { return container }
+        let scale = min(container.width / contentSize.width,
+                        container.height / contentSize.height)
+        let fitted = CGSize(width: contentSize.width * scale,
+                            height: contentSize.height * scale)
+        return CGRect(
+            x: container.midX - fitted.width / 2,
+            y: container.midY - fitted.height / 2,
+            width: fitted.width,
+            height: fitted.height
+        )
+    }
+
+    private func drawUserText(in size: CGSize, scale: CGFloat) {
+        for box in textStore.boxes {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .left
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: box.fontSize * scale),
+                .foregroundColor: UIColor.label,
+                .paragraphStyle: paragraph
+            ]
+            let string = NSAttributedString(string: box.text, attributes: attributes)
+            let width = max(1, (box.frame.width - 12) * scale)
+            let rect = CGRect(
+                x: (box.frame.x + 6) * scale,
+                y: box.frame.y * scale,
+                width: width,
+                height: min(size.height - box.frame.y * scale,
+                            box.frame.height * scale)
+            )
+            string.draw(
+                with: rect,
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            )
+        }
     }
 
     private func drawGrid(in cg: CGContext, size: CGSize) {
@@ -397,40 +951,5 @@ struct PageEditor: View {
             (label as NSString).draw(at: CGPoint(x: 2, y: y + 2),
                                      withAttributes: labelAttrs)
         }
-    }
-}
-
-private struct CoordinateGrid: View {
-    let bounds: CGRect
-    var body: some View {
-        Canvas { ctx, _ in
-            guard bounds.width > 0, bounds.height > 0 else { return }
-            let steps = 10
-            for i in 0...steps {
-                let f = CGFloat(i) / CGFloat(steps)
-                let strong = (i % 5 == 0)
-                let col = Color.blue.opacity(strong ? 0.45 : 0.20)
-                let x = bounds.minX + f * bounds.width
-                let y = bounds.minY + f * bounds.height
-                var v = Path()
-                v.move(to: CGPoint(x: x, y: bounds.minY))
-                v.addLine(to: CGPoint(x: x, y: bounds.maxY))
-                ctx.stroke(v, with: .color(col), lineWidth: 1)
-                var h = Path()
-                h.move(to: CGPoint(x: bounds.minX, y: y))
-                h.addLine(to: CGPoint(x: bounds.maxX, y: y))
-                ctx.stroke(h, with: .color(col), lineWidth: 1)
-                let label = String(format: "%.1f", Double(f))
-                ctx.draw(Text(label).font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(.blue),
-                         at: CGPoint(x: x + 8, y: bounds.minY + 8),
-                         anchor: .topLeading)
-                ctx.draw(Text(label).font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(.blue),
-                         at: CGPoint(x: bounds.minX + 8, y: y + 8),
-                         anchor: .topLeading)
-            }
-        }
-        .allowsHitTesting(false)
     }
 }

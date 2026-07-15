@@ -19,6 +19,8 @@ struct DrawingActionDTO: Codable {
     enum Kind: String, Codable {
         case path      // freehand polyline from explicit fractional points
         case text      // single label in empty canvas space
+        case equation  // TeX-style mathematical notation
+        case plot      // deterministic mathematical/data graph
         case node      // labeled circle (one node, manually placed)
         case edge      // line between two anchors, optional arrowhead
         case tree      // composite: parent-linked nodes, auto-laid-out
@@ -33,6 +35,8 @@ struct DrawingActionDTO: Codable {
     let height: Double?
     let color: String?
     let text: String?
+    let latex: String?
+    let plot: MathPlotSpec?
 
     // path
     let points: [[Double]]?    // [[x,y], [x,y], ...]
@@ -106,89 +110,579 @@ extension DrawingActionDTO {
         DrawingActionDTO(type: type,
                          x: x.map { $0 + dx }, y: y.map { $0 + dy },
                          width: width, height: height,
-                         color: color, text: text, points: points,
+                         color: color, text: text, latex: latex, plot: plot,
+                         points: points,
                          from: from, to: to, arrowhead: arrowhead,
                          nodes: nodes)
     }
+
+    /// Copy with an explicit frame in the persistent canvas coordinate
+    /// space. Text/equation coordinates are center anchors; plot/tree
+    /// coordinates are top-left anchors with an explicit size.
+    func placed(in frame: CGRect, canvasBounds: CGRect) -> DrawingActionDTO {
+        let usesTopLeft = type == .plot || type == .tree
+        let px = usesTopLeft ? frame.minX : frame.midX
+        let py = usesTopLeft ? frame.minY : frame.midY
+        return DrawingActionDTO(
+            type: type,
+            x: Double((px - canvasBounds.minX) / canvasBounds.width),
+            y: Double((py - canvasBounds.minY) / canvasBounds.height),
+            // Label width/height are internal layout constraints. They let a
+            // collision-driven shrink survive into ActionExpander instead of
+            // being remeasured at the original full size.
+            width: type == .node ? width : Double(frame.width / canvasBounds.width),
+            height: type == .node ? height : Double(frame.height / canvasBounds.height),
+            color: color,
+            text: text,
+            latex: latex,
+            plot: plot,
+            points: points,
+            from: from,
+            to: to,
+            arrowhead: arrowhead,
+            nodes: nodes
+        )
+    }
+
+    func replacingText(_ replacement: String) -> DrawingActionDTO {
+        DrawingActionDTO(type: type, x: x, y: y, width: width, height: height,
+                         color: color, text: replacement, latex: latex, plot: plot,
+                         points: points, from: from, to: to,
+                         arrowhead: arrowhead, nodes: nodes)
+    }
 }
 
-// MARK: - Text block placement (avoid ink / controls / prior AI content)
+// MARK: - AI label measurement
 
-/// Moves the TEXT actions of a batch — as one rigid block, preserving
-/// their relative layout — away from occupied regions when they'd land on
-/// top of the student's handwriting, earlier AI ink, or the app's corner
-/// buttons. Only text moves: paths/edges/trees may be deliberately aimed
-/// at the student's work (circling an answer must NOT be relocated).
-enum TextBlockPlacer {
-    static func adjust(_ actions: [DrawingActionDTO],
-                       canvasBounds: CGRect,
-                       avoid: [CGRect]) -> [DrawingActionDTO] {
-        guard !avoid.isEmpty else { return actions }
-        let textIdx = actions.indices.filter {
-            actions[$0].type == .text && actions[$0].x != nil
-                && actions[$0].y != nil && actions[$0].text != nil
+/// Shared metrics for placement, live rendering, persistence bounds, and
+/// snapshots. Keeping these paths on one measurement model prevents a label
+/// that looked safe to the placer from being wider when it was finally drawn.
+enum AILabelLayout {
+    struct Metrics {
+        let size: CGSize
+        let fontSize: CGFloat
+    }
+
+    static func plainSize(text: String, fontSize: CGFloat) -> CGSize {
+        let font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let lines = text.components(separatedBy: .newlines)
+        let width = lines.map {
+            ($0 as NSString).size(withAttributes: [.font: font]).width
+        }.max() ?? 0
+        return CGSize(width: ceil(width),
+                      height: ceil(font.lineHeight * CGFloat(max(1, lines.count))))
+    }
+
+    /// Inserts deterministic line breaks instead of relying on the live
+    /// SwiftUI renderer and the snapshot CoreText renderer to wrap at
+    /// subtly different glyph positions.
+    static func wrappedPlain(text: String, maxWidth: CGFloat,
+                             fontSize: CGFloat = 16) -> String {
+        guard maxWidth > 1 else { return text }
+        let font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
+        func width(_ value: String) -> CGFloat {
+            (value as NSString).size(withAttributes: [.font: font]).width
         }
-        guard !textIdx.isEmpty else { return actions }
-
-        func rect(for a: DrawingActionDTO) -> CGRect {
-            let cx = canvasBounds.minX + CGFloat(a.x!) * canvasBounds.width
-            let cy = canvasBounds.minY + CGFloat(a.y!) * canvasBounds.height
-            // ~16pt semibold: ≈9.5pt per character, 22pt line height.
-            let w = CGFloat(a.text!.count) * 9.5 + 8
-            return CGRect(x: cx - w / 2, y: cy - 11, width: w, height: 22)
-        }
-        let rects = textIdx.map { rect(for: actions[$0]) }
-        var union = rects[0]
-        for r in rects.dropFirst() { union = union.union(r) }
-
-        // Overlap (pt²) with occupied regions + heavy penalty for leaving
-        // the canvas, at a given block translation.
-        func score(_ dx: CGFloat, _ dy: CGFloat) -> CGFloat {
-            var s: CGFloat = 0
-            for r in rects {
-                let rr = r.offsetBy(dx: dx, dy: dy)
-                let clipped = rr.intersection(canvasBounds)
-                let clippedArea = clipped.isNull ? 0 : clipped.width * clipped.height
-                s += (rr.width * rr.height - clippedArea) * 3
-                for a in avoid {
-                    let i = rr.intersection(a)
-                    if !i.isNull { s += i.width * i.height }
+        func chunks(of word: String) -> [String] {
+            guard width(word) > maxWidth else { return [word] }
+            var chunks: [String] = []
+            var current = ""
+            for character in word {
+                let next = current + String(character)
+                if !current.isEmpty, width(next) > maxWidth {
+                    chunks.append(current)
+                    current = String(character)
+                } else {
+                    current = next
                 }
             }
-            return s
+            if !current.isEmpty { chunks.append(current) }
+            return chunks
         }
 
-        let base = score(0, 0)
-        let blockArea = rects.reduce(CGFloat(0)) { $0 + $1.width * $1.height }
-        // Under ~12% covered: the model's placement is fine, don't move.
-        guard base > blockArea * 0.12 else { return actions }
+        return text.components(separatedBy: .newlines).map { paragraph in
+            let words = paragraph.split(whereSeparator: { $0.isWhitespace })
+                .flatMap { chunks(of: String($0)) }
+            guard !words.isEmpty else { return "" }
+            var lines: [String] = []
+            var line = ""
+            for word in words {
+                let proposed = line.isEmpty ? word : line + " " + word
+                if !line.isEmpty, width(proposed) > maxWidth {
+                    lines.append(line)
+                    line = word
+                } else {
+                    line = proposed
+                }
+            }
+            if !line.isEmpty { lines.append(line) }
+            return lines.joined(separator: "\n")
+        }.joined(separator: "\n")
+    }
 
-        // Grid search over whole-block translations. Distance from the
-        // model's requested spot is only a TIE-BREAKER (tiny weight): a
-        // strong distance penalty made any move cost more than the total
-        // overlap of a short label, so exactly the "one short answer
-        // label buried in handwriting" case could never relocate.
-        var best: (dx: CGFloat, dy: CGFloat, overlap: CGFloat, scored: CGFloat) =
-            (0, 0, base, base)
-        let steps = 10
-        for ix in 0...steps {
-            for iy in 0...steps {
-                let dx = (CGFloat(ix) / CGFloat(steps) - 0.5) * canvasBounds.width
-                let dy = (CGFloat(iy) / CGFloat(steps) - 0.5) * canvasBounds.height
-                let o = score(dx, dy)
-                let s = o + hypot(dx, dy) * 0.05
-                if s < best.scored { best = (dx, dy, o, s) }
+    static func adaptivePlain(text: String, maxSize: CGSize) -> Metrics {
+        let baseFontSize: CGFloat = 16
+        let base = plainSize(text: text, fontSize: baseFontSize)
+        let scale = min(1,
+                        maxSize.width / max(1, base.width),
+                        maxSize.height / max(1, base.height))
+        let fontSize = max(11, baseFontSize * scale)
+        return Metrics(size: plainSize(text: text, fontSize: fontSize),
+                       fontSize: fontSize)
+    }
+
+    static func adaptiveMath(latex: String, maxSize: CGSize) -> Metrics {
+        let baseFontSize: CGFloat = 22
+        let base = MathLabelRenderer.measure(latex: latex, fontSize: baseFontSize)
+        let scale = min(1,
+                        maxSize.width / max(1, base.width),
+                        maxSize.height / max(1, base.height))
+        let fontSize = max(13, baseFontSize * scale)
+        return Metrics(
+            size: MathLabelRenderer.measure(latex: latex, fontSize: fontSize),
+            fontSize: fontSize
+        )
+    }
+
+    static func rect(for label: StoredAILabel) -> CGRect {
+        let size: CGSize
+        if label.format == "latex" {
+            size = MathLabelRenderer.measure(
+                latex: label.text,
+                fontSize: CGFloat(label.fontSize ?? 22)
+            )
+        } else {
+            size = plainSize(text: label.text,
+                             fontSize: CGFloat(label.fontSize ?? 16))
+        }
+        return CGRect(x: CGFloat(label.canvasX) - size.width / 2,
+                      y: CGFloat(label.canvasY) - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
+    static func plainImage(text: String, color: UIColor,
+                           fontSize: CGFloat, leading: Bool,
+                           scale: CGFloat = 2) -> UIImage {
+        let size = plainSize(text: text, fontSize: fontSize)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale
+        format.opaque = false
+        return UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = leading ? .left : .center
+            paragraph.lineBreakMode = .byClipping
+            let attributed = NSAttributedString(
+                string: text,
+                attributes: [
+                    .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
+                    .foregroundColor: color,
+                    .paragraphStyle: paragraph
+                ]
+            )
+            attributed.draw(
+                with: CGRect(origin: .zero, size: size),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            )
+        }
+    }
+}
+
+// MARK: - Content placement (avoid ink / controls / prior AI content)
+
+/// Places explanation text, equations, plots, and trees one at a time.
+/// Requested coordinates are preserved when the full footprint is safe.
+/// When they are not, a bounded deterministic search uses the full page —
+/// including left and right lanes — and adds each result to the keep-out set
+/// before placing the next action. Targeted paths/edges are never relocated.
+enum TextBlockPlacer {
+    struct Result {
+        let actions: [DrawingActionDTO]
+        /// Inflated plot/tree boxes persisted by AIDrawingPlayer. Their
+        /// interiors otherwise look deceptively empty when inferred only
+        /// from thin PencilKit axis/curve stroke bounds on the next call.
+        let reservedRects: [CGRect]
+        let skippedCount: Int
+    }
+
+    private struct Candidate {
+        let frame: CGRect
+        let scale: CGFloat
+        let overlap: CGFloat
+        let score: CGFloat
+    }
+
+    private static let contentGap: CGFloat = 10
+
+    static func adjust(_ actions: [DrawingActionDTO],
+                       canvasBounds: CGRect,
+                       avoid: [CGRect]) -> Result {
+        guard canvasBounds.width > 0, canvasBounds.height > 0 else {
+            return Result(actions: actions, reservedRects: [], skippedCount: 0)
+        }
+
+        let edge = min(14, max(8, min(canvasBounds.width, canvasBounds.height) * 0.015))
+        let safeBounds = canvasBounds.insetBy(dx: edge, dy: edge)
+        var occupied = avoid.compactMap { normalized($0, inside: canvasBounds) }
+            .map { $0.insetBy(dx: -contentGap, dy: -contentGap) }
+        var output: [DrawingActionDTO] = []
+        var persistedReservations: [CGRect] = []
+        var skippedCount = 0
+
+        for rawAction in actions {
+            let action = prepared(rawAction, safeBounds: safeBounds)
+            guard let requested = footprint(for: action,
+                                            canvasBounds: canvasBounds,
+                                            safeBounds: safeBounds) else {
+                if isRelocatable(action.type) {
+                    skippedCount += 1
+                } else {
+                    output.append(action)
+                }
+                continue
+            }
+
+            if isRelocatable(action.type) {
+                let result = bestCandidate(for: action,
+                                           requested: requested,
+                                           canvasBounds: canvasBounds,
+                                           safeBounds: safeBounds,
+                                           occupied: occupied)
+                // A completely full page is not permission to cover the
+                // student's work. Tiny labels are tried before this point;
+                // if even those collide, omit the structured action.
+                guard result.overlap < 0.5 else {
+                    skippedCount += 1
+                    continue
+                }
+                let placedAction = action.placed(in: result.frame,
+                                                 canvasBounds: canvasBounds)
+                output.append(placedAction)
+                occupied.append(result.frame.insetBy(dx: -contentGap,
+                                                      dy: -contentGap))
+                if action.type == .plot || action.type == .tree {
+                    let inflated = result.frame.insetBy(dx: -contentGap,
+                                                        dy: -contentGap)
+                        .intersection(canvasBounds)
+                    if !inflated.isNull { persistedReservations.append(inflated) }
+                }
+            } else {
+                output.append(action)
+                // Targeted paths and edges keep their coordinates, but later
+                // explanatory content in this same response must avoid them.
+                occupied.append(requested.insetBy(dx: -contentGap,
+                                                   dy: -contentGap))
             }
         }
-        // Move only for a real overlap improvement, judged on overlap alone.
-        guard best.overlap < base * 0.4, base - best.overlap > 80,
-              best.dx != 0 || best.dy != 0 else { return actions }
 
-        let fdx = Double(best.dx / canvasBounds.width)
-        let fdy = Double(best.dy / canvasBounds.height)
-        var out = actions
-        for i in textIdx { out[i] = out[i].offsetBy(dx: fdx, dy: fdy) }
-        return out
+        return Result(actions: output, reservedRects: persistedReservations,
+                      skippedCount: skippedCount)
+    }
+
+    private static func prepared(_ action: DrawingActionDTO,
+                                 safeBounds: CGRect) -> DrawingActionDTO {
+        guard action.type == .text, let text = action.text else { return action }
+        // A prose block uses at most one page column. This provides useful
+        // left/right lanes and avoids the old behavior where a long single
+        // line was forcibly centered and still extended past both edges.
+        let requested = action.width.map { CGFloat($0) * safeBounds.width }
+        let columnWidth = min(safeBounds.width,
+                              max(160, requested ?? safeBounds.width * 0.46))
+        return action.replacingText(
+            AILabelLayout.wrappedPlain(text: text, maxWidth: columnWidth)
+        )
+    }
+
+    static func labelMetrics(for action: DrawingActionDTO,
+                             canvasBounds: CGRect) -> AILabelLayout.Metrics? {
+        let edge = min(14, max(8, min(canvasBounds.width, canvasBounds.height) * 0.015))
+        let safeSize = canvasBounds.insetBy(dx: edge, dy: edge).size
+        let maximum = CGSize(
+            width: min(safeSize.width,
+                       action.width.map { max(1, CGFloat($0) * canvasBounds.width) }
+                           ?? safeSize.width),
+            height: min(safeSize.height,
+                        action.height.map { max(1, CGFloat($0) * canvasBounds.height) }
+                            ?? safeSize.height)
+        )
+        let metrics: AILabelLayout.Metrics?
+        switch action.type {
+        case .text:
+            guard let text = action.text else { return nil }
+            metrics = AILabelLayout.adaptivePlain(text: text, maxSize: maximum)
+        case .equation:
+            guard let latex = action.latex ?? action.text else { return nil }
+            metrics = AILabelLayout.adaptiveMath(latex: latex, maxSize: maximum)
+        default:
+            return nil
+        }
+        guard let metrics,
+              metrics.size.width <= maximum.width + 0.5,
+              metrics.size.height <= maximum.height + 0.5 else { return nil }
+        return metrics
+    }
+
+    private static func isRelocatable(_ type: DrawingActionDTO.Kind) -> Bool {
+        type == .text || type == .equation || type == .plot
+            || type == .tree || type == .node
+    }
+
+    private static func footprint(for action: DrawingActionDTO,
+                                  canvasBounds: CGRect,
+                                  safeBounds: CGRect) -> CGRect? {
+        switch action.type {
+        case .text, .equation:
+            guard let x = action.x, let y = action.y,
+                  let metrics = labelMetrics(for: action,
+                                             canvasBounds: canvasBounds) else { return nil }
+            let center = canvasPoint(x, y, in: canvasBounds)
+            return CGRect(x: center.x - metrics.size.width / 2,
+                          y: center.y - metrics.size.height / 2,
+                          width: metrics.size.width, height: metrics.size.height)
+        case .plot:
+            return topLeftBox(for: action, canvasBounds: canvasBounds,
+                              safeBounds: safeBounds,
+                              defaultOrigin: CGPoint(x: 0.08, y: 0.18),
+                              defaultSize: CGSize(width: 0.72, height: 0.60),
+                              minimumSize: CGSize(width: 120, height: 100))
+        case .tree:
+            return topLeftBox(for: action, canvasBounds: canvasBounds,
+                              safeBounds: safeBounds,
+                              defaultOrigin: CGPoint(x: 0.1, y: 0.1),
+                              defaultSize: CGSize(width: 0.8, height: 0.6),
+                              minimumSize: CGSize(width: 80, height: 80))
+        case .node:
+            guard let x = action.x, let y = action.y else { return nil }
+            let center = canvasPoint(x, y, in: canvasBounds)
+            let diameter = max(40, CGFloat(action.width ?? 0.08) * canvasBounds.width)
+            return CGRect(x: center.x - diameter / 2, y: center.y - diameter / 2,
+                          width: diameter, height: diameter)
+        case .path:
+            let points = (action.points ?? []).compactMap { point -> CGPoint? in
+                guard point.count >= 2 else { return nil }
+                return canvasPoint(point[0], point[1], in: canvasBounds)
+            }
+            return pointsBounds(points)
+        case .edge:
+            let points = [action.from, action.to].compactMap {
+                rawAnchor($0, canvasBounds: canvasBounds)
+            }
+            return pointsBounds(points)
+        }
+    }
+
+    private static func topLeftBox(for action: DrawingActionDTO,
+                                   canvasBounds: CGRect,
+                                   safeBounds: CGRect,
+                                   defaultOrigin: CGPoint,
+                                   defaultSize: CGSize,
+                                   minimumSize: CGSize) -> CGRect {
+        let rawWidth = CGFloat(action.width ?? Double(defaultSize.width)) * canvasBounds.width
+        let rawHeight = CGFloat(action.height ?? Double(defaultSize.height)) * canvasBounds.height
+        let width = min(safeBounds.width, max(minimumSize.width, rawWidth))
+        let height = min(safeBounds.height, max(minimumSize.height, rawHeight))
+        let x = canvasBounds.minX
+            + CGFloat(action.x ?? Double(defaultOrigin.x)) * canvasBounds.width
+        let y = canvasBounds.minY
+            + CGFloat(action.y ?? Double(defaultOrigin.y)) * canvasBounds.height
+        return fit(CGRect(x: x, y: y, width: width, height: height),
+                   inside: safeBounds)
+    }
+
+    private static func bestCandidate(for action: DrawingActionDTO,
+                                      requested: CGRect,
+                                      canvasBounds: CGRect,
+                                      safeBounds: CGRect,
+                                      occupied: [CGRect]) -> Candidate {
+        let requestedFitted = fit(requested, inside: safeBounds)
+        let exactOverlap = overlapArea(of: requestedFitted, with: occupied)
+        let isCenteredLabel = (action.type == .text || action.type == .equation)
+            && abs(requestedFitted.midX - safeBounds.midX) < safeBounds.width * 0.12
+        let isBesideContent = occupied.contains {
+            requestedFitted.insetBy(dx: -28, dy: -28).intersects($0)
+        }
+        let preferOpenLane = isCenteredLabel && !isBesideContent
+        if exactOverlap < 0.5, !preferOpenLane {
+            return Candidate(frame: requestedFitted, scale: 1,
+                             overlap: 0, score: 0)
+        }
+
+        let canShrink = action.type == .plot || action.type == .tree
+            || action.type == .text || action.type == .equation
+        let minimum: CGSize
+        if action.type == .plot {
+            minimum = CGSize(width: min(120, safeBounds.width),
+                             height: min(100, safeBounds.height))
+        } else if action.type == .tree {
+            minimum = CGSize(width: min(80, safeBounds.width),
+                             height: min(80, safeBounds.height))
+        } else {
+            minimum = CGSize(width: 1, height: 1)
+        }
+        let scales: [CGFloat]
+        if action.type == .text || action.type == .equation {
+            let metrics = labelMetrics(for: action,
+                                       canvasBounds: canvasBounds)
+            let floor: CGFloat = action.type == .text ? 11 : 13
+            let minimumScale = metrics.map { floor / max(floor, $0.fontSize) } ?? 1
+            scales = [1, 0.9, 0.82, 0.74, 0.68, 0.60]
+                .filter { $0 + 0.001 >= minimumScale }
+        } else {
+            scales = canShrink ? [1, 0.86, 0.72, 0.58, 0.45] : [1]
+        }
+        var best: Candidate?
+        var seenSizes = Set<String>()
+
+        for nominalScale in scales {
+            let size = CGSize(
+                width: min(safeBounds.width,
+                           max(minimum.width, requested.width * nominalScale)),
+                height: min(safeBounds.height,
+                            max(minimum.height, requested.height * nominalScale))
+            )
+            let sizeKey = "\(Int(size.width.rounded()))x\(Int(size.height.rounded()))"
+            guard seenSizes.insert(sizeKey).inserted else { continue }
+            let actualScale = min(size.width / max(1, requested.width),
+                                  size.height / max(1, requested.height))
+
+            for origin in candidateOrigins(size: size,
+                                           requested: requestedFitted,
+                                           safeBounds: safeBounds,
+                                           occupied: occupied) {
+                let frame = CGRect(origin: origin, size: size)
+                let overlap = overlapArea(of: frame, with: occupied)
+                let normalizedOverlap = overlap / max(1, frame.width * frame.height)
+                let distance = hypot(frame.midX - requested.midX,
+                                     frame.midY - requested.midY)
+                    / max(1, hypot(safeBounds.width, safeBounds.height))
+                let shrinkPenalty = (1 - actualScale) * 240
+                // Collision dominates every other preference. Scale is next,
+                // then distance, then a tiny reading-order nudge for stable
+                // top/left choices when candidates are otherwise identical.
+                let readingOrder = ((frame.minY - safeBounds.minY) / max(1, safeBounds.height))
+                    + ((frame.minX - safeBounds.minX) / max(1, safeBounds.width)) * 0.1
+                let centerLanePenalty: CGFloat = preferOpenLane
+                    && abs(frame.midX - safeBounds.midX) < safeBounds.width * 0.18
+                    ? 18 : 0
+                let score = normalizedOverlap * 1_000_000
+                    + shrinkPenalty + distance * 40 + centerLanePenalty
+                    + readingOrder * 0.01
+                let candidate = Candidate(frame: frame, scale: actualScale,
+                                          overlap: overlap, score: score)
+                if best == nil || candidate.score < best!.score {
+                    best = candidate
+                }
+            }
+        }
+
+        return best ?? Candidate(frame: requestedFitted, scale: 1,
+                                 overlap: exactOverlap,
+                                 score: exactOverlap)
+    }
+
+    private static func candidateOrigins(size: CGSize,
+                                         requested: CGRect,
+                                         safeBounds: CGRect,
+                                         occupied: [CGRect]) -> [CGPoint] {
+        let maxX = safeBounds.maxX - size.width
+        let maxY = safeBounds.maxY - size.height
+        func clamped(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: min(maxX, max(safeBounds.minX, x)),
+                    y: min(maxY, max(safeBounds.minY, y)))
+        }
+
+        var result: [CGPoint] = [clamped(requested.minX, requested.minY)]
+        var seen = Set<String>()
+        func append(_ point: CGPoint) {
+            let p = clamped(point.x, point.y)
+            let key = "\(Int((p.x * 2).rounded())):\(Int((p.y * 2).rounded()))"
+            if seen.insert(key).inserted { result.append(p) }
+        }
+
+        // Full-width lanes are intentional: they keep repeated center
+        // requests from consuming only one vertical strip of the page.
+        let xSteps = 8
+        let ySteps = 12
+        for ix in 0...xSteps {
+            let x = safeBounds.minX
+                + (maxX - safeBounds.minX) * CGFloat(ix) / CGFloat(xSteps)
+            for iy in 0...ySteps {
+                let y = safeBounds.minY
+                    + (maxY - safeBounds.minY) * CGFloat(iy) / CGFloat(ySteps)
+                append(CGPoint(x: x, y: y))
+            }
+        }
+
+        // Obstacle-edge candidates catch narrow but useful gaps that a
+        // coarse grid can straddle. Cap the work so placement remains
+        // deterministic even on pages containing thousands of strokes.
+        let nearby = occupied.sorted {
+            hypot($0.midX - requested.midX, $0.midY - requested.midY)
+                < hypot($1.midX - requested.midX, $1.midY - requested.midY)
+        }.prefix(96)
+        for obstacle in nearby {
+            append(CGPoint(x: obstacle.minX - size.width - contentGap,
+                           y: requested.minY))
+            append(CGPoint(x: obstacle.maxX + contentGap,
+                           y: requested.minY))
+            append(CGPoint(x: requested.minX,
+                           y: obstacle.minY - size.height - contentGap))
+            append(CGPoint(x: requested.minX,
+                           y: obstacle.maxY + contentGap))
+        }
+        return result
+    }
+
+    private static func overlapArea(of frame: CGRect, with occupied: [CGRect]) -> CGFloat {
+        occupied.reduce(into: CGFloat(0)) { total, obstacle in
+            let intersection = frame.intersection(obstacle)
+            if !intersection.isNull {
+                total += max(0, intersection.width) * max(0, intersection.height)
+            }
+        }
+    }
+
+    private static func fit(_ frame: CGRect, inside bounds: CGRect) -> CGRect {
+        var result = frame
+        result.size.width = min(max(1, result.width), bounds.width)
+        result.size.height = min(max(1, result.height), bounds.height)
+        result.origin.x = min(bounds.maxX - result.width,
+                              max(bounds.minX, result.minX))
+        result.origin.y = min(bounds.maxY - result.height,
+                              max(bounds.minY, result.minY))
+        return result
+    }
+
+    private static func normalized(_ rect: CGRect, inside bounds: CGRect) -> CGRect? {
+        guard !rect.isNull, !rect.isInfinite,
+              rect.minX.isFinite, rect.minY.isFinite,
+              rect.maxX.isFinite, rect.maxY.isFinite,
+              rect.width > 0, rect.height > 0 else { return nil }
+        let clipped = rect.intersection(bounds)
+        return clipped.isNull ? nil : clipped
+    }
+
+    private static func canvasPoint(_ x: Double, _ y: Double,
+                                    in bounds: CGRect) -> CGPoint {
+        CGPoint(x: bounds.minX + CGFloat(min(1, max(0, x))) * bounds.width,
+                y: bounds.minY + CGFloat(min(1, max(0, y))) * bounds.height)
+    }
+
+    private static func pointsBounds(_ points: [CGPoint]) -> CGRect? {
+        guard let first = points.first else { return nil }
+        return points.dropFirst().reduce(CGRect(origin: first, size: .zero)) {
+            $0.union(CGRect(origin: $1, size: .zero))
+        }.insetBy(dx: -3, dy: -3)
+    }
+
+    private static func rawAnchor(_ value: String?,
+                                  canvasBounds: CGRect) -> CGPoint? {
+        guard let value, !value.hasPrefix("id:") else { return nil }
+        let parts = value.split(separator: ",").compactMap {
+            Double($0.trimmingCharacters(in: .whitespaces))
+        }
+        guard parts.count == 2 else { return nil }
+        return canvasPoint(parts[0], parts[1], in: canvasBounds)
     }
 }
 
@@ -202,11 +696,39 @@ struct StoredAILabel: Codable {
     var canvasY: Double
     var text: String
     var color: String?
+    /// Optional for backward compatibility with notes saved before math
+    /// labels existed. Unknown values intentionally fall back to plain text.
+    var format: String? = nil
+    var fontSize: Double? = nil
+    /// Direct AI prose uses leading-aligned, explicitly wrapped lines.
+    /// Nil retains centered rendering for legacy labels and graph/node text.
+    var alignment: String? = nil
+}
+
+struct StoredCanvasRect: Codable {
+    var x: Double
+    var y: Double
+    var width: Double
+    var height: Double
+
+    nonisolated init(_ rect: CGRect) {
+        x = Double(rect.minX)
+        y = Double(rect.minY)
+        width = Double(rect.width)
+        height = Double(rect.height)
+    }
+
+    nonisolated var cgRect: CGRect {
+        CGRect(x: x, y: y, width: width, height: height)
+    }
 }
 
 struct StoredAIDrawing: Codable {
     var pkDrawingBytes: Data        // PKDrawing.dataRepresentation()
     var labels: [StoredAILabel]
+    /// Optional keeps existing notes decodable. These are inflated boxes for
+    /// structured content whose sparse strokes do not describe its footprint.
+    var reservedRects: [StoredCanvasRect]? = nil
 }
 
 // MARK: - RenderStep (intermediate, what the player consumes)
@@ -216,7 +738,13 @@ struct StoredAIDrawing: Codable {
 // each .label fades in.
 enum RenderStep {
     case stroke(points: [CGPoint], color: UIColor)
+    /// Dense deterministic geometry (axes, hatching, bars) commits in one
+    /// batch instead of animating every short segment for 0.18 seconds.
+    case strokeGroup(paths: [[CGPoint]], color: UIColor, thickness: CGFloat)
     case label(at: CGPoint, text: String, color: UIColor)
+    case proseLabel(at: CGPoint, text: String, color: UIColor, fontSize: CGFloat)
+    case sizedLabel(at: CGPoint, text: String, color: UIColor, fontSize: CGFloat)
+    case mathLabel(at: CGPoint, latex: String, color: UIColor, fontSize: CGFloat)
 }
 
 // MARK: - Expander (DTOs → RenderSteps in canvas coords)
@@ -247,11 +775,22 @@ final class ActionExpander {
     var finalAnchors: [String: CGPoint] { nodeAnchors }
 
     func expand(_ actions: [DrawingActionDTO]) -> [RenderStep] {
+        expandReporting(actions).steps
+    }
+
+    /// Counts source actions that produced at least one concrete render step.
+    /// This lets the live tool response distinguish schema-valid actions from
+    /// actions that could not resolve an anchor or otherwise rendered nothing.
+    func expandReporting(_ actions: [DrawingActionDTO])
+        -> (steps: [RenderStep], renderedActionCount: Int) {
         var steps: [RenderStep] = []
+        var renderedActionCount = 0
         for action in actions {
-            steps.append(contentsOf: expandOne(action))
+            let expanded = expandOne(action)
+            if !expanded.isEmpty { renderedActionCount += 1 }
+            steps.append(contentsOf: expanded)
         }
-        return steps
+        return (steps, renderedActionCount)
     }
 
     // MARK: per-type expansion
@@ -260,6 +799,8 @@ final class ActionExpander {
         switch a.type {
         case .path: return expandPath(a)
         case .text: return expandText(a)
+        case .equation: return expandEquation(a)
+        case .plot: return expandPlot(a)
         case .node: return expandNode(a)
         case .edge: return expandEdge(a)
         case .tree: return expandTree(a)
@@ -328,14 +869,89 @@ final class ActionExpander {
 
     private func expandText(_ a: DrawingActionDTO) -> [RenderStep] {
         guard let nx = a.x, let ny = a.y, let text = a.text else { return [] }
+        guard let metrics = TextBlockPlacer.labelMetrics(for: a,
+                                                         canvasBounds: canvasBounds) else {
+            return []
+        }
         var p = canvasPoint(nx, ny)
-        // Keep the whole (center-anchored) label on-canvas, not just its
-        // center — long labels near an edge used to run off-screen.
-        let halfW = min(canvasBounds.width / 2, CGFloat(text.count) * 9.5 / 2 + 4)
-        let halfH: CGFloat = 11
+        let halfW = metrics.size.width / 2
+        let halfH = metrics.size.height / 2
         p.x = min(canvasBounds.maxX - halfW, max(canvasBounds.minX + halfW, p.x))
         p.y = min(canvasBounds.maxY - halfH, max(canvasBounds.minY + halfH, p.y))
-        return [.label(at: p, text: text, color: a.uiColor)]
+        return [.proseLabel(at: p, text: text, color: a.uiColor,
+                            fontSize: metrics.fontSize)]
+    }
+
+    private func expandEquation(_ a: DrawingActionDTO) -> [RenderStep] {
+        guard let nx = a.x, let ny = a.y,
+              let latex = a.latex ?? a.text, !latex.isEmpty else { return [] }
+        guard let metrics = TextBlockPlacer.labelMetrics(for: a,
+                                                         canvasBounds: canvasBounds) else {
+            return []
+        }
+        var p = canvasPoint(nx, ny)
+        let halfW = metrics.size.width / 2
+        let halfH = metrics.size.height / 2
+        p.x = min(canvasBounds.maxX - halfW, max(canvasBounds.minX + halfW, p.x))
+        p.y = min(canvasBounds.maxY - halfH, max(canvasBounds.minY + halfH, p.y))
+        return [.mathLabel(at: p, latex: latex, color: a.uiColor,
+                           fontSize: metrics.fontSize)]
+    }
+
+    private func expandPlot(_ a: DrawingActionDTO) -> [RenderStep] {
+        guard let spec = a.plot else { return [] }
+
+        let margin: CGFloat = 10
+        var box = CGRect(
+            x: canvasBounds.minX + CGFloat(a.x ?? 0.08) * canvasBounds.width,
+            y: canvasBounds.minY + CGFloat(a.y ?? 0.18) * canvasBounds.height,
+            width: CGFloat(a.width ?? 0.72) * canvasBounds.width,
+            height: CGFloat(a.height ?? 0.60) * canvasBounds.height
+        )
+        box.size.width = min(max(box.width, 120), canvasBounds.width - margin * 2)
+        box.size.height = min(max(box.height, 100), canvasBounds.height - margin * 2)
+        box.origin.x = min(canvasBounds.maxX - margin - box.width,
+                           max(canvasBounds.minX + margin, box.origin.x))
+        box.origin.y = min(canvasBounds.maxY - margin - box.height,
+                           max(canvasBounds.minY + margin, box.origin.y))
+
+        guard let output = try? MathPlotRenderer.render(spec: spec, in: box),
+              !output.isEmpty else { return [] }
+
+        let color = a.uiColor
+        var steps: [RenderStep] = []
+        if !output.hatchPaths.isEmpty {
+            steps.append(.strokeGroup(
+                paths: output.hatchPaths,
+                // PencilKit normalizes translucent PKInk colors during
+                // archival on some OS versions, which made inequality fill
+                // disappear entirely. Thin opaque hatching stays visible
+                // while leaving the underlying page readable.
+                color: color,
+                thickness: 2.0
+            ))
+        }
+        let straightSegments = output.straightPathGroups.flatMap { path in
+            zip(path, path.dropFirst()).map { [$0.0, $0.1] }
+        }
+        if !straightSegments.isEmpty {
+            steps.append(.strokeGroup(paths: straightSegments,
+                                      color: color, thickness: 2.2))
+        }
+        if !output.smoothPathGroups.isEmpty {
+            steps.append(.strokeGroup(paths: output.smoothPathGroups,
+                                      color: color, thickness: 3.0))
+        }
+        steps += output.labels.map { label in
+            if case .title = label.role,
+               label.text.contains(where: { "^_=\\<>".contains($0) }) {
+                return .mathLabel(at: label.position, latex: label.text,
+                                  color: color, fontSize: label.fontSize)
+            }
+            return .sizedLabel(at: label.position, text: label.text,
+                               color: color, fontSize: label.fontSize)
+        }
+        return steps
     }
 
     private func expandNode(_ a: DrawingActionDTO) -> [RenderStep] {
