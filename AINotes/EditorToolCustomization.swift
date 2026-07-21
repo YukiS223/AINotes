@@ -12,11 +12,10 @@ enum EditorPickerItemID {
     static let lasso = "com.yukis.ainotes.tool.lasso"
     static let text = "com.yukis.ainotes.tool.text"
 
-    /// Items rendered by PencilKit itself. Text and shapes live in the
-    /// adjacent app toolbar menu because custom PencilKit item artwork is
-    /// clipped in narrow iPad Split View and compact layouts.
+    /// Items shown in the flat bottom drawing toolbar. Selection, Text, and
+    /// Shapes live in the adjacent navigation-bar menu.
     static let nativePickerIDs: Set<String> = [
-        pen, pencil, marker, eraser, lasso
+        pen, pencil, marker, eraser
     ]
 
     static func shape(_ kind: ShapeKind) -> String {
@@ -54,7 +53,10 @@ struct EditorToolDescriptor: Identifiable, Hashable {
               symbol: $0.symbolName, group: .shapes)
     }
 
-    static let defaultIDs = Set(all.map(\.id))
+    static let knownIDs = Set(all.map(\.id))
+    /// Pencil remains available in Customize Tools, but leaving it out of
+    /// the default row keeps the primary controls compact on smaller screens.
+    static let defaultEnabledIDs = knownIDs.subtracting([EditorPickerItemID.pencil])
 }
 
 @MainActor
@@ -62,21 +64,32 @@ struct EditorToolDescriptor: Identifiable, Hashable {
 final class EditorToolConfiguration {
     static let shared = EditorToolConfiguration()
 
-    private static let defaultsKey = "editor.enabledToolPickerItems.v1"
+    private static let defaultsKey = "editor.enabledToolPickerItems.v2"
+    private static let legacyDefaultsKey = "editor.enabledToolPickerItems.v1"
     private(set) var enabledIDs: Set<String>
 
     private init() {
-        if let saved = UserDefaults.standard.array(forKey: Self.defaultsKey) as? [String] {
-            var known = Set(saved).intersection(EditorToolDescriptor.defaultIDs)
-            if known.isEmpty { known = EditorToolDescriptor.defaultIDs }
-            // The native picker must retain one real item even when the
-            // separated Text/Shapes menu is the user's primary workflow.
+        let current = UserDefaults.standard.array(forKey: Self.defaultsKey) as? [String]
+        let legacy = UserDefaults.standard.array(forKey: Self.legacyDefaultsKey) as? [String]
+        if let saved = current ?? legacy {
+            var known = Set(saved).intersection(EditorToolDescriptor.knownIDs)
+            if known.isEmpty { known = EditorToolDescriptor.defaultEnabledIDs }
+            // Migrate the old untouched "everything on" default to the new
+            // spacious layout. Preserve genuinely customized legacy sets.
+            if current == nil, known == EditorToolDescriptor.knownIDs {
+                known = EditorToolDescriptor.defaultEnabledIDs
+            }
+            // Retain one drawing item even when the separated editor menu is
+            // the user's primary workflow.
             if known.isDisjoint(with: EditorPickerItemID.nativePickerIDs) {
                 known.insert(EditorPickerItemID.pen)
             }
             enabledIDs = known
+            if current == nil {
+                UserDefaults.standard.set(Array(known).sorted(), forKey: Self.defaultsKey)
+            }
         } else {
-            enabledIDs = EditorToolDescriptor.defaultIDs
+            enabledIDs = EditorToolDescriptor.defaultEnabledIDs
         }
     }
 
@@ -85,14 +98,13 @@ final class EditorToolConfiguration {
     }
 
     func setEnabled(_ enabled: Bool, for identifier: String) {
-        guard EditorToolDescriptor.defaultIDs.contains(identifier) else { return }
+        guard EditorToolDescriptor.knownIDs.contains(identifier) else { return }
         var next = enabledIDs
         if enabled {
             next.insert(identifier)
         } else {
-            // PKToolPicker requires at least one item. Keeping the final
-            // item also prevents a customized notebook from opening with
-            // no way to select a tool.
+            // Keeping the final item prevents a customized notebook from
+            // opening with no way to select a drawing tool.
             guard next.count > 1 else { return }
             next.remove(identifier)
             guard !next.isDisjoint(with: EditorPickerItemID.nativePickerIDs) else {
@@ -103,7 +115,7 @@ final class EditorToolConfiguration {
     }
 
     func reset() {
-        apply(EditorToolDescriptor.defaultIDs)
+        apply(EditorToolDescriptor.defaultEnabledIDs)
     }
 
     private func apply(_ next: Set<String>) {

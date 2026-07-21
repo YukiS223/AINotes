@@ -144,8 +144,10 @@ extension DrawingActionDTO {
         )
     }
 
-    func replacingText(_ replacement: String) -> DrawingActionDTO {
-        DrawingActionDTO(type: type, x: x, y: y, width: width, height: height,
+    func replacingText(_ replacement: String,
+                       layoutWidth: Double? = nil) -> DrawingActionDTO {
+        DrawingActionDTO(type: type, x: x, y: y,
+                         width: layoutWidth ?? width, height: height,
                          color: color, text: replacement, latex: latex, plot: plot,
                          points: points, from: from, to: to,
                          arrowhead: arrowhead, nodes: nodes)
@@ -312,6 +314,11 @@ enum TextBlockPlacer {
         let score: CGFloat
     }
 
+    private struct Placement {
+        let action: DrawingActionDTO
+        let candidate: Candidate
+    }
+
     private static let contentGap: CGFloat = 10
 
     static func adjust(_ actions: [DrawingActionDTO],
@@ -329,8 +336,32 @@ enum TextBlockPlacer {
         var persistedReservations: [CGRect] = []
         var skippedCount = 0
 
-        for rawAction in actions {
-            let action = prepared(rawAction, safeBounds: safeBounds)
+        for action in actions {
+            // Prose is evaluated at several wrap widths. A wide empty row
+            // can use nearly the whole page, while a narrow gap beside ink
+            // can still accept the same text as a compact column.
+            if action.type == .text {
+                guard let placement = bestProsePlacement(
+                    for: action,
+                    canvasBounds: canvasBounds,
+                    safeBounds: safeBounds,
+                    occupied: occupied
+                ), placement.candidate.overlap < 0.5 else {
+                    skippedCount += 1
+                    continue
+                }
+                let placedAction = placement.action.placed(
+                    in: placement.candidate.frame,
+                    canvasBounds: canvasBounds
+                )
+                output.append(placedAction)
+                occupied.append(placement.candidate.frame.insetBy(
+                    dx: -contentGap,
+                    dy: -contentGap
+                ))
+                continue
+            }
+
             guard let requested = footprint(for: action,
                                             canvasBounds: canvasBounds,
                                             safeBounds: safeBounds) else {
@@ -379,18 +410,70 @@ enum TextBlockPlacer {
                       skippedCount: skippedCount)
     }
 
-    private static func prepared(_ action: DrawingActionDTO,
-                                 safeBounds: CGRect) -> DrawingActionDTO {
-        guard action.type == .text, let text = action.text else { return action }
-        // A prose block uses at most one page column. This provides useful
-        // left/right lanes and avoids the old behavior where a long single
-        // line was forcibly centered and still extended past both edges.
-        let requested = action.width.map { CGFloat($0) * safeBounds.width }
-        let columnWidth = min(safeBounds.width,
-                              max(160, requested ?? safeBounds.width * 0.46))
-        return action.replacingText(
-            AILabelLayout.wrappedPlain(text: text, maxWidth: columnWidth)
-        )
+    private static func bestProsePlacement(
+        for action: DrawingActionDTO,
+        canvasBounds: CGRect,
+        safeBounds: CGRect,
+        occupied: [CGRect]
+    ) -> Placement? {
+        guard let text = action.text, action.x != nil, action.y != nil else {
+            return nil
+        }
+
+        var widths: [CGFloat] = []
+        if let requested = action.width, requested > 0 {
+            widths.append(CGFloat(requested) * canvasBounds.width)
+        }
+        widths += [0.92, 0.76, 0.60, 0.46, 0.34, 0.26].map {
+            safeBounds.width * $0
+        }
+
+        var best: Placement?
+        var seenLayouts = Set<String>()
+        for proposedWidth in widths {
+            let layoutWidth = min(
+                safeBounds.width,
+                max(min(120, safeBounds.width), proposedWidth)
+            )
+            let wrapped = AILabelLayout.wrappedPlain(
+                text: text,
+                maxWidth: layoutWidth
+            )
+            let layoutKey = "\(Int(layoutWidth.rounded())):\(wrapped)"
+            guard seenLayouts.insert(layoutKey).inserted else { continue }
+
+            let variant = action.replacingText(
+                wrapped,
+                layoutWidth: Double(layoutWidth / canvasBounds.width)
+            )
+            guard let requested = footprint(
+                for: variant,
+                canvasBounds: canvasBounds,
+                safeBounds: safeBounds
+            ) else { continue }
+            let candidate = bestCandidate(
+                for: variant,
+                requested: requested,
+                canvasBounds: canvasBounds,
+                safeBounds: safeBounds,
+                occupied: occupied
+            )
+
+            let lineCount = max(1, wrapped.components(separatedBy: .newlines).count)
+            let unusedWidth = max(0, 1 - layoutWidth / max(1, safeBounds.width))
+            let layoutPenalty = CGFloat(lineCount - 1) * 2 + unusedWidth * 6
+            let scored = Candidate(
+                frame: candidate.frame,
+                scale: candidate.scale,
+                overlap: candidate.overlap,
+                score: candidate.score + layoutPenalty
+            )
+            let placement = Placement(action: variant, candidate: scored)
+            if best == nil || scored.score < best!.candidate.score {
+                best = placement
+            }
+        }
+        return best
     }
 
     static func labelMetrics(for action: DrawingActionDTO,
@@ -417,8 +500,13 @@ enum TextBlockPlacer {
             return nil
         }
         guard let metrics,
-              metrics.size.width <= maximum.width + 0.5,
-              metrics.size.height <= maximum.height + 0.5 else { return nil }
+              // Persisted normalized dimensions can round-trip a measured
+              // UIKit glyph box a fraction of a point smaller. The placer
+              // already reserves a 10pt gap, so a two-point tolerance keeps
+              // an otherwise identical label renderable without risking a
+              // visual collision or canvas overflow.
+              metrics.size.width <= maximum.width + 2,
+              metrics.size.height <= maximum.height + 2 else { return nil }
         return metrics
     }
 
@@ -498,11 +586,11 @@ enum TextBlockPlacer {
         let exactOverlap = overlapArea(of: requestedFitted, with: occupied)
         let isCenteredLabel = (action.type == .text || action.type == .equation)
             && abs(requestedFitted.midX - safeBounds.midX) < safeBounds.width * 0.12
-        let isBesideContent = occupied.contains {
-            requestedFitted.insetBy(dx: -28, dy: -28).intersects($0)
-        }
-        let preferOpenLane = isCenteredLabel && !isBesideContent
-        if exactOverlap < 0.5, !preferOpenLane {
+        // Gemini often defaults labels to (0.5, 0.5). Treat that as a hint,
+        // not an instruction to build a single center column. Non-centered
+        // coordinates remain exact when they are safe.
+        let repackCenteredLabel = isCenteredLabel
+        if exactOverlap < 0.5, !repackCenteredLabel {
             return Candidate(frame: requestedFitted, scale: 1,
                              overlap: 0, score: 0)
         }
@@ -520,10 +608,16 @@ enum TextBlockPlacer {
             minimum = CGSize(width: 1, height: 1)
         }
         let scales: [CGFloat]
-        if action.type == .text || action.type == .equation {
+        if action.type == .text {
+            // Prose already tries several real wrap widths. Scaling its
+            // measured frame introduces fractional line-height rounding and
+            // can make the final persisted constraint one pixel too short;
+            // keep prose at a readable 16pt and choose another wrap instead.
+            scales = [1]
+        } else if action.type == .equation {
             let metrics = labelMetrics(for: action,
                                        canvasBounds: canvasBounds)
-            let floor: CGFloat = action.type == .text ? 11 : 13
+            let floor: CGFloat = 13
             let minimumScale = metrics.map { floor / max(floor, $0.fontSize) } ?? 1
             scales = [1, 0.9, 0.82, 0.74, 0.68, 0.60]
                 .filter { $0 + 0.001 >= minimumScale }
@@ -561,12 +655,12 @@ enum TextBlockPlacer {
                 // top/left choices when candidates are otherwise identical.
                 let readingOrder = ((frame.minY - safeBounds.minY) / max(1, safeBounds.height))
                     + ((frame.minX - safeBounds.minX) / max(1, safeBounds.width)) * 0.1
-                let centerLanePenalty: CGFloat = preferOpenLane
+                let centerLanePenalty: CGFloat = repackCenteredLabel
                     && abs(frame.midX - safeBounds.midX) < safeBounds.width * 0.18
-                    ? 18 : 0
+                    ? 90 : 0
                 let score = normalizedOverlap * 1_000_000
-                    + shrinkPenalty + distance * 40 + centerLanePenalty
-                    + readingOrder * 0.01
+                    + shrinkPenalty + distance * 6 + centerLanePenalty
+                    + readingOrder * 18
                 let candidate = Candidate(frame: frame, scale: actualScale,
                                           overlap: overlap, score: score)
                 if best == nil || candidate.score < best!.score {
@@ -601,14 +695,18 @@ enum TextBlockPlacer {
 
         // Full-width lanes are intentional: they keep repeated center
         // requests from consuming only one vertical strip of the page.
-        let xSteps = 8
-        let ySteps = 12
-        for ix in 0...xSteps {
-            let x = safeBounds.minX
+        let xSteps = 10
+        let ySteps = 14
+        let coarseX = (0...xSteps).map { ix in
+            safeBounds.minX
                 + (maxX - safeBounds.minX) * CGFloat(ix) / CGFloat(xSteps)
-            for iy in 0...ySteps {
-                let y = safeBounds.minY
-                    + (maxY - safeBounds.minY) * CGFloat(iy) / CGFloat(ySteps)
+        }
+        let coarseY = (0...ySteps).map { iy in
+            safeBounds.minY
+                + (maxY - safeBounds.minY) * CGFloat(iy) / CGFloat(ySteps)
+        }
+        for x in coarseX {
+            for y in coarseY {
                 append(CGPoint(x: x, y: y))
             }
         }
@@ -619,16 +717,19 @@ enum TextBlockPlacer {
         let nearby = occupied.sorted {
             hypot($0.midX - requested.midX, $0.midY - requested.midY)
                 < hypot($1.midX - requested.midX, $1.midY - requested.midY)
-        }.prefix(96)
+        }.prefix(32)
         for obstacle in nearby {
-            append(CGPoint(x: obstacle.minX - size.width - contentGap,
-                           y: requested.minY))
-            append(CGPoint(x: obstacle.maxX + contentGap,
-                           y: requested.minY))
-            append(CGPoint(x: requested.minX,
-                           y: obstacle.minY - size.height - contentGap))
-            append(CGPoint(x: requested.minX,
-                           y: obstacle.maxY + contentGap))
+            // Test obstacle edges across the entire page rather than only
+            // along the model's requested x/y. This catches useful corner
+            // and margin gaps that the old center-biased search never saw.
+            for y in coarseY {
+                append(CGPoint(x: obstacle.minX - size.width - contentGap, y: y))
+                append(CGPoint(x: obstacle.maxX + contentGap, y: y))
+            }
+            for x in coarseX {
+                append(CGPoint(x: x, y: obstacle.minY - size.height - contentGap))
+                append(CGPoint(x: x, y: obstacle.maxY + contentGap))
+            }
         }
         return result
     }

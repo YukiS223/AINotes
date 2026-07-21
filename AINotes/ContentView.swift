@@ -306,7 +306,6 @@ private struct ImportFailure: Identifiable {
 struct PageEditor: View {
     @Bindable var page: Page
     let isActive: Bool
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var drawing = PKDrawing()
     @State private var showTutor = false
     @State private var toolMode: CanvasToolMode = .ink
@@ -321,7 +320,34 @@ struct PageEditor: View {
     @State private var pendingTextPoint: CGPoint?
     @State private var hasLoadedPersisted = false
     @State private var showToolCustomization = false
+    @State private var showInkSettings = false
+    @State private var showEraserSettings = false
     @State private var toolConfiguration = EditorToolConfiguration.shared
+    @AppStorage("editor.eraser.width.v1")
+    private var eraserWidth = Double(PKEraserTool.EraserType.fixedWidthBitmap.defaultWidth)
+    @AppStorage("editor.floatingToolbar.normalizedX.v1")
+    private var toolbarNormalizedX = 0.5
+    @AppStorage("editor.floatingToolbar.normalizedY.v1")
+    private var toolbarNormalizedY = 1.0
+    @State private var toolbarSize = CGSize(width: 640, height: 64)
+    @State private var toolbarDragStart: CGPoint?
+    @State private var transientToolbarCenter: CGPoint?
+    @State private var selectedNativeToolID =
+        SharedToolPicker.lastInkItemIdentifier ?? EditorPickerItemID.pen
+    @State private var lastInkingToolID =
+        SharedToolPicker.lastInkItemIdentifier ?? EditorPickerItemID.pen
+    @State private var inkColor = Color(uiColor: SharedToolPicker.lastInkTool.color)
+    @State private var inkWidths: [String: Double] = {
+        var widths: [String: Double] = [
+            EditorPickerItemID.pen: 4,
+            EditorPickerItemID.pencil: 4,
+            EditorPickerItemID.marker: 12
+        ]
+        if let identifier = SharedToolPicker.lastInkItemIdentifier {
+            widths[identifier] = Double(SharedToolPicker.lastInkTool.width)
+        }
+        return widths
+    }()
 
     // Mark-over-ink layer (existing).
     @State private var aiAnnotations: [AnnotationDTO] = []
@@ -373,22 +399,66 @@ struct PageEditor: View {
                         y: max(0, (viewportSize.height - displayedSize.height) / 2)
                     )
                     .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+
+                if isActive {
+                    EditorInkToolbar(
+                        enabledIDs: toolConfiguration.enabledIDs,
+                        activeToolID: activeEditorToolID,
+                        inkColor: inkColor,
+                        onUndo: canvasController.undo,
+                        onRedo: canvasController.redo,
+                        onSelectTool: selectEditorTool,
+                        onSelectColor: selectInkColor,
+                        onShowToolSettings: openToolSettings,
+                        onCustomize: { showToolCustomization = true },
+                        onMoveChanged: { translation in
+                            updateToolbarDrag(translation, viewportSize: viewportSize)
+                        },
+                        onMoveEnded: { translation in
+                            finishToolbarDrag(translation, viewportSize: viewportSize)
+                        }
+                    )
+                    // An explicit proposal is required here: a horizontal
+                    // ScrollView reports its full content as an ideal width,
+                    // which would otherwise stretch the floating capsule to
+                    // both screen edges before it becomes scrollable.
+                    .frame(width: max(1, min(760, viewportSize.width - 24)))
+                    .onGeometryChange(for: CGSize.self) { proxy in
+                        proxy.size
+                    } action: { newSize in
+                        guard newSize.width > 0, newSize.height > 0 else { return }
+                        toolbarSize = newSize
+                    }
+                    .position(toolbarCenter(in: viewportSize))
+                    .zIndex(10)
+                }
             }
             .clipped()
             .onAppear { updateCanvasSize(viewportSize) }
             .onChange(of: viewportSize) { _, new in updateCanvasSize(new) }
         }
-        .ignoresSafeArea(edges: .bottom)
         .toolbar {
             if isActive {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if hasSeparatedEditorTools {
                         Menu {
-                            if toolConfiguration.isEnabled(EditorPickerItemID.text) {
-                                Button {
-                                    toolMode = .text
-                                } label: {
-                                    Label("Text", systemImage: "character.cursor.ibeam")
+                            if toolConfiguration.isEnabled(EditorPickerItemID.lasso)
+                                || toolConfiguration.isEnabled(EditorPickerItemID.text) {
+                                Section("Editing") {
+                                    if toolConfiguration.isEnabled(EditorPickerItemID.lasso) {
+                                        Button {
+                                            toolMode = .selection
+                                        } label: {
+                                            Label("Selection", systemImage: "lasso")
+                                        }
+                                    }
+                                    if toolConfiguration.isEnabled(EditorPickerItemID.text) {
+                                        Button {
+                                            toolMode = .text
+                                        } label: {
+                                            Label("Text", systemImage: "character.cursor.ibeam")
+                                        }
+                                    }
                                 }
                             }
 
@@ -407,16 +477,8 @@ struct PageEditor: View {
                                 }
                             }
                         } label: {
-                            Label("Text and Shapes", systemImage: separatedToolSymbol)
-                        }
-                    }
-                    // PKToolPicker only promises its accessory item in
-                    // expanded layouts. Keep customization reachable in
-                    // iPhone and narrow Split View without duplicating it on
-                    // the full-width iPad picker.
-                    if horizontalSizeClass == .compact {
-                        Button("Customize Tools", systemImage: "slider.horizontal.3") {
-                            showToolCustomization = true
+                            Label("Selection, Text, and Shapes",
+                                  systemImage: separatedToolSymbol)
                         }
                     }
                     if hasAIContent {
@@ -440,6 +502,7 @@ struct PageEditor: View {
             hasLoadedPersisted = true
             initializeReferenceCanvasIfNeeded(minimumSize: canvasSize)
             refreshBackgroundAvoidRects()
+            normalizeNativeToolSelection()
             // End Session must kill EVERYTHING in flight — including a
             // drawing animation that would otherwise keep painting after
             // the connection is gone. Bind the player directly (not via
@@ -479,6 +542,8 @@ struct PageEditor: View {
         }
         .onChange(of: toolConfiguration.enabledIDs) { _, enabledIDs in
             switch toolMode {
+            case .selection where !enabledIDs.contains(EditorPickerItemID.lasso):
+                toolMode = .ink
             case .text where !enabledIDs.contains(EditorPickerItemID.text):
                 toolMode = .ink
             case .shape(let kind)
@@ -487,6 +552,7 @@ struct PageEditor: View {
             case .ink, .selection, .text, .shape:
                 break
             }
+            normalizeNativeToolSelection()
         }
 
         .sheet(isPresented: $showTutor) {
@@ -502,7 +568,9 @@ struct PageEditor: View {
                     Task {
                         await aiPlayer.play(actions: drawings, canvasBounds: bounds,
                                             userInk: ink,
-                                            avoidRects: backgroundAvoidRects)
+                                            avoidRects: backgroundAvoidRects
+                                                + legacyAnnotationAvoidRects
+                                                + floatingToolbarAvoidRects)
                         saveAIDrawing()
                         // Ship a frame NOW so the model sees its own ink
                         // land instead of waiting for the next heartbeat.
@@ -518,6 +586,19 @@ struct PageEditor: View {
         .sheet(isPresented: $showToolCustomization) {
             EditorToolCustomizationView(configuration: toolConfiguration)
                 .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showInkSettings) {
+            EditorInkSettingsView(
+                color: inkColorBinding,
+                width: inkWidthBinding
+            )
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showEraserSettings) {
+            EditorEraserSettingsView(width: $eraserWidth)
+                .presentationDetents([.medium])
                 .presentationDragIndicator(.visible)
         }
         .alert(editingTextID == nil ? "Add Text" : "Edit Text",
@@ -549,6 +630,9 @@ struct PageEditor: View {
                 enabledToolIDs: toolConfiguration.enabledIDs.intersection(
                     EditorPickerItemID.nativePickerIDs
                 ),
+                selectedNativeToolID: selectedNativeToolID,
+                inkColor: UIColor(inkColor),
+                inkWidth: selectedToolWidth,
                 isActive: isActive,
                 onRequestToolCustomization: {
                     showToolCustomization = true
@@ -724,10 +808,292 @@ struct PageEditor: View {
     }
 
     private var hasSeparatedEditorTools: Bool {
-        toolConfiguration.isEnabled(EditorPickerItemID.text)
+        toolConfiguration.isEnabled(EditorPickerItemID.lasso)
+            || toolConfiguration.isEnabled(EditorPickerItemID.text)
             || ShapeKind.allCases.contains {
                 toolConfiguration.isEnabled(EditorPickerItemID.shape($0))
             }
+    }
+
+    // MARK: - Floating toolbar
+
+    private func toolbarCenter(in viewportSize: CGSize) -> CGPoint {
+        let stored = CGPoint(
+            x: CGFloat(toolbarNormalizedX) * viewportSize.width,
+            y: CGFloat(toolbarNormalizedY) * viewportSize.height
+        )
+        return clampedToolbarCenter(
+            transientToolbarCenter ?? stored,
+            viewportSize: viewportSize
+        )
+    }
+
+    private func clampedToolbarCenter(_ proposed: CGPoint,
+                                      viewportSize: CGSize) -> CGPoint {
+        guard viewportSize.width > 0, viewportSize.height > 0 else {
+            return proposed
+        }
+
+        let edgeMargin: CGFloat = 12
+        // TabView's page control and the device home indicator occupy this
+        // lower strip. The movable toolbar can never be stranded on top of it.
+        let bottomNavigationReserve: CGFloat = 68
+        let halfWidth = min(toolbarSize.width / 2,
+                            max(0, viewportSize.width / 2 - edgeMargin))
+        let halfHeight = min(toolbarSize.height / 2,
+                             max(0, viewportSize.height / 2 - edgeMargin))
+        let minX = edgeMargin + halfWidth
+        let maxX = viewportSize.width - edgeMargin - halfWidth
+        let minY = edgeMargin + halfHeight
+        let maxY = viewportSize.height - bottomNavigationReserve - halfHeight
+
+        return CGPoint(
+            x: minX <= maxX
+                ? min(maxX, max(minX, proposed.x))
+                : viewportSize.width / 2,
+            y: minY <= maxY
+                ? min(maxY, max(minY, proposed.y))
+                : viewportSize.height / 2
+        )
+    }
+
+    private func updateToolbarDrag(_ translation: CGSize,
+                                   viewportSize: CGSize) {
+        if toolbarDragStart == nil {
+            toolbarDragStart = toolbarCenter(in: viewportSize)
+        }
+        guard let start = toolbarDragStart else { return }
+        transientToolbarCenter = clampedToolbarCenter(
+            CGPoint(x: start.x + translation.width,
+                    y: start.y + translation.height),
+            viewportSize: viewportSize
+        )
+    }
+
+    private func finishToolbarDrag(_ translation: CGSize,
+                                   viewportSize: CGSize) {
+        let start = toolbarDragStart ?? toolbarCenter(in: viewportSize)
+        let final = clampedToolbarCenter(
+            CGPoint(x: start.x + translation.width,
+                    y: start.y + translation.height),
+            viewportSize: viewportSize
+        )
+        if viewportSize.width > 0, viewportSize.height > 0 {
+            toolbarNormalizedX = Double(final.x / viewportSize.width)
+            toolbarNormalizedY = Double(final.y / viewportSize.height)
+        }
+        transientToolbarCenter = nil
+        toolbarDragStart = nil
+    }
+
+    /// The toolbar floats above the page, so translate its visible frame back
+    /// into the persistent canvas coordinate space for AI collision checks.
+    private var floatingToolbarAvoidRects: [CGRect] {
+        let viewportSize = canvasSize
+        let pageSize = stablePageSize
+        guard viewportSize.width > 0, viewportSize.height > 0,
+              pageSize.width > 0, pageSize.height > 0 else { return [] }
+
+        let scale = pageDisplayScale(pageSize: pageSize,
+                                     viewportSize: viewportSize)
+        guard scale > 0 else { return [] }
+        let displayedSize = CGSize(width: pageSize.width * scale,
+                                   height: pageSize.height * scale)
+        let pageOrigin = CGPoint(
+            x: max(0, (viewportSize.width - displayedSize.width) / 2),
+            y: max(0, (viewportSize.height - displayedSize.height) / 2)
+        )
+        let pageFrame = CGRect(origin: pageOrigin, size: displayedSize)
+        let center = toolbarCenter(in: viewportSize)
+        let toolbarFrame = CGRect(
+            x: center.x - toolbarSize.width / 2,
+            y: center.y - toolbarSize.height / 2,
+            width: toolbarSize.width,
+            height: toolbarSize.height
+        ).insetBy(dx: -8, dy: -8)
+        let overlap = toolbarFrame.intersection(pageFrame)
+        guard !overlap.isNull, overlap.width > 0, overlap.height > 0 else {
+            return []
+        }
+
+        return [CGRect(
+            x: (overlap.minX - pageOrigin.x) / scale,
+            y: (overlap.minY - pageOrigin.y) / scale,
+            width: overlap.width / scale,
+            height: overlap.height / scale
+        )]
+    }
+
+    /// Older notes may still contain the original annotation layer. Include
+    /// those marks—especially its `write` labels—in placement keep-out zones
+    /// so newer AI explanations never cover prior AI content.
+    private var legacyAnnotationAvoidRects: [CGRect] {
+        guard aiBounds.width > 0, aiBounds.height > 0 else { return [] }
+
+        func point(_ x: Double, _ y: Double) -> CGPoint {
+            CGPoint(x: aiBounds.minX + CGFloat(x) * aiBounds.width,
+                    y: aiBounds.minY + CGFloat(y) * aiBounds.height)
+        }
+
+        return aiAnnotations.compactMap { annotation in
+            switch annotation.type {
+            case .circle, .highlight:
+                guard let x = annotation.x, let y = annotation.y,
+                      let width = annotation.width, let height = annotation.height else {
+                    return nil
+                }
+                let origin = point(x, y)
+                return CGRect(x: origin.x, y: origin.y,
+                              width: CGFloat(width) * aiBounds.width,
+                              height: CGFloat(height) * aiBounds.height)
+            case .arrow:
+                guard let x1 = annotation.x1, let y1 = annotation.y1,
+                      let x2 = annotation.x2, let y2 = annotation.y2 else {
+                    return nil
+                }
+                let start = point(x1, y1)
+                let end = point(x2, y2)
+                return CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                              width: abs(end.x - start.x),
+                              height: abs(end.y - start.y))
+                    .insetBy(dx: -8, dy: -8)
+            case .write:
+                guard let x = annotation.x, let y = annotation.y,
+                      let text = annotation.text else { return nil }
+                let origin = point(x, y)
+                let font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+                let size = (text as NSString).size(withAttributes: [.font: font])
+                return CGRect(origin: origin,
+                              size: CGSize(width: ceil(size.width),
+                                           height: ceil(font.lineHeight)))
+            }
+        }
+    }
+
+    private var orderedEnabledNativeToolIDs: [String] {
+        EditorToolDescriptor.all.compactMap { descriptor in
+            guard EditorPickerItemID.nativePickerIDs.contains(descriptor.id),
+                  toolConfiguration.isEnabled(descriptor.id) else { return nil }
+            return descriptor.id
+        }
+    }
+
+    private var orderedEnabledInkingToolIDs: [String] {
+        orderedEnabledNativeToolIDs.filter { $0 != EditorPickerItemID.eraser }
+    }
+
+    private var activeEditorToolID: String? {
+        switch toolMode {
+        case .ink:
+            return selectedNativeToolID
+        case .selection:
+            return EditorPickerItemID.lasso
+        case .text:
+            return EditorPickerItemID.text
+        case .shape(let kind):
+            return EditorPickerItemID.shape(kind)
+        }
+    }
+
+    private var selectedToolWidth: CGFloat {
+        if selectedNativeToolID == EditorPickerItemID.eraser {
+            let range = PKEraserTool.EraserType.fixedWidthBitmap.validWidthRange
+            return min(range.upperBound,
+                       max(range.lowerBound, CGFloat(eraserWidth)))
+        }
+        return CGFloat(inkWidths[selectedNativeToolID] ?? 4)
+    }
+
+    private var inkColorBinding: Binding<Color> {
+        Binding(
+            get: { inkColor },
+            set: { selectInkColor($0) }
+        )
+    }
+
+    private var inkWidthBinding: Binding<Double> {
+        Binding(
+            get: { inkWidths[lastInkingToolID] ?? 4 },
+            set: { width in
+                guard orderedEnabledInkingToolIDs.contains(lastInkingToolID) else {
+                    return
+                }
+                inkWidths[lastInkingToolID] = width
+                selectedNativeToolID = lastInkingToolID
+                toolMode = .ink
+            }
+        )
+    }
+
+    private func selectNativeTool(_ identifier: String) {
+        guard toolConfiguration.isEnabled(identifier),
+              EditorPickerItemID.nativePickerIDs.contains(identifier) else { return }
+        selectedNativeToolID = identifier
+        if identifier != EditorPickerItemID.eraser {
+            lastInkingToolID = identifier
+        }
+        toolMode = .ink
+    }
+
+    private func selectEditorTool(_ identifier: String) {
+        guard toolConfiguration.isEnabled(identifier) else { return }
+        switch identifier {
+        case EditorPickerItemID.lasso:
+            toolMode = .selection
+        case EditorPickerItemID.text:
+            toolMode = .text
+        default:
+            if let kind = EditorPickerItemID.shapeKind(for: identifier) {
+                toolMode = .shape(kind)
+            } else {
+                selectNativeTool(identifier)
+            }
+        }
+    }
+
+    private func selectInkColor(_ color: Color) {
+        guard let inkingID = resolvedEnabledInkingToolID() else { return }
+        inkColor = color
+        lastInkingToolID = inkingID
+        selectedNativeToolID = inkingID
+        toolMode = .ink
+    }
+
+    private func openInkSettings() {
+        guard let inkingID = resolvedEnabledInkingToolID() else { return }
+        lastInkingToolID = inkingID
+        selectedNativeToolID = inkingID
+        toolMode = .ink
+        showInkSettings = true
+    }
+
+    private func openToolSettings() {
+        if toolMode == .ink,
+           selectedNativeToolID == EditorPickerItemID.eraser {
+            showEraserSettings = true
+        } else {
+            openInkSettings()
+        }
+    }
+
+    private func resolvedEnabledInkingToolID() -> String? {
+        if orderedEnabledInkingToolIDs.contains(lastInkingToolID) {
+            return lastInkingToolID
+        }
+        return orderedEnabledInkingToolIDs.first
+    }
+
+    private func normalizeNativeToolSelection() {
+        let enabled = orderedEnabledNativeToolIDs
+        guard !enabled.isEmpty else { return }
+        if !enabled.contains(selectedNativeToolID) {
+            selectedNativeToolID = enabled.first ?? EditorPickerItemID.pen
+        }
+        if selectedNativeToolID != EditorPickerItemID.eraser {
+            lastInkingToolID = selectedNativeToolID
+        } else if let fallback = orderedEnabledInkingToolIDs.first {
+            lastInkingToolID = fallback
+        }
     }
 
     private var separatedToolSymbol: String {
@@ -736,7 +1102,9 @@ struct PageEditor: View {
             return "character.cursor.ibeam"
         case .shape(let kind):
             return kind.symbolName
-        case .ink, .selection:
+        case .selection:
+            return "lasso"
+        case .ink:
             return "square.on.circle"
         }
     }
